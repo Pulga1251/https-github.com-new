@@ -221,23 +221,54 @@ async function sendImageToWorker({ telegram_id, chat_id, message_id, fileUrl, fi
   const data = await res.json().catch(() => null);
   return { res, data };
 }
+// ✅ helper: manda imagem pro Worker
+async function sendImageToWorker({ telegram_id, chat_id, message_id, fileUrl, filename }) {
+  const imgResp = await fetch(fileUrl);
+  if (!imgResp.ok) throw new Error("Falha ao baixar imagem do Telegram");
+
+  const buf = Buffer.from(await imgResp.arrayBuffer());
+
+  const form = new FormData();
+  form.append("telegram_id", telegram_id);
+  form.append("chat_id", chat_id);
+  form.append("message_id", message_id);
+  form.append("image", buf, { filename: filename || "ticket.jpg", contentType: "image/jpeg" });
+
+  const res = await fetch(`${WORKER_BASE}/api/ai/parse-ticket`, {
+    method: "POST",
+    headers: {
+      "X-INGEST-KEY": INGEST_KEY,
+      ...form.getHeaders(),
+    },
+    body: form,
+  });
+
+  const data = await res.json().catch(() => null);
+  return { res, data };
+}
 
 // ✅ FOTO normal (galeria/câmera)
 bot.on("photo", async (ctx) => {
   try {
     console.log("PHOTO RECEIVED");
+
     const telegram_id = String(ctx.from?.id || "").trim();
     const chat_id = String(ctx.chat?.id || "").trim();
     const message_id = String(ctx.message?.message_id || "").trim();
 
     const photos = ctx.message.photo || [];
     const best = photos[photos.length - 1];
-    if (!best?.file_id) return ctx.reply("❌ Não achei o file_id da foto.");
+    if (!best?.file_id) {
+      await ctx.reply("❌ Não achei o file_id da foto.");
+      return;
+    }
 
     const link = await ctx.telegram.getFileLink(best.file_id);
 
     const { res, data } = await sendImageToWorker({
-      telegram_id, chat_id, message_id,
+      telegram_id,
+      chat_id,
+      message_id,
       fileUrl: link.href,
       filename: "ticket.jpg",
     });
@@ -245,21 +276,79 @@ bot.on("photo", async (ctx) => {
     if (!res.ok) {
       console.log("WORKER ERROR:", res.status, data);
       if (data?.code === "NOT_LINKED") {
-        return ctx.reply("⚠️ Seu Telegram não está vinculado. Use /vincular 123456.");
+        await ctx.reply("⚠️ Seu Telegram não está vinculado. Use /vincular 123456.");
+        return;
       }
-      return ctx.reply(`❌ Worker erro (${res.status}): ${data?.message || "Falha"}`);
+      await ctx.reply(`❌ Worker erro (${res.status}): ${data?.message || "Falha"}`);
+      return;
     }
 
-    return ctx.reply(
-      `✅ Worker recebeu (teste)\nuser_id: ${data.user_id}\n` +
+    await ctx.reply(
+      `✅ Worker recebeu (teste)\n` +
+      `user_id: ${data.user_id}\n` +
       `arquivo: ${data.file?.name}\n` +
       `tamanho: ${data.file?.size} bytes`
+    );
+  } catch (e) {
+    console.error("PHOTO HANDLER ERROR:", e);
+    await ctx.reply("❌ Erro ao processar a foto.");
+  }
+});
 
+// ✅ Se a imagem for enviada como ARQUIVO (document)
+bot.on("document", async (ctx) => {
+  try {
+    console.log("DOCUMENT RECEIVED");
+
+    const telegram_id = String(ctx.from?.id || "").trim();
+    const chat_id = String(ctx.chat?.id || "").trim();
+    const message_id = String(ctx.message?.message_id || "").trim();
+
+    const doc = ctx.message.document;
+    const mime = String(doc?.mime_type || "");
+    const name = String(doc?.file_name || "ticket.jpg");
+
+    if (!mime.startsWith("image/")) {
+      await ctx.reply("📎 Recebi um arquivo, mas não parece imagem. Envie como foto/imagem.");
+      return;
+    }
+
+    const link = await ctx.telegram.getFileLink(doc.file_id);
+
+    const { res, data } = await sendImageToWorker({
+      telegram_id,
+      chat_id,
+      message_id,
+      fileUrl: link.href,
+      filename: name,
+    });
+
+    if (!res.ok) {
+      console.log("WORKER ERROR:", res.status, data);
+      if (data?.code === "NOT_LINKED") {
+        await ctx.reply("⚠️ Seu Telegram não está vinculado. Use /vincular 123456.");
+        return;
+      }
+      await ctx.reply(`❌ Worker erro (${res.status}): ${data?.message || "Falha"}`);
+      return;
+    }
+
+    await ctx.reply(
+      `✅ Worker recebeu (teste)\n` +
+      `user_id: ${data.user_id}\n` +
+      `arquivo: ${data.file?.name}\n` +
+      `tamanho: ${data.file?.size} bytes`
+    );
+  } catch (e) {
+    console.error("DOCUMENT HANDLER ERROR:", e);
+    await ctx.reply("❌ Erro ao processar o arquivo.");
+  }
+});
+
+// ✅ webhook (resolve 409)
 const PORT = Number(process.env.PORT || 3000);
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
 const WEBHOOK_SECRET = String(process.env.WEBHOOK_SECRET || "bagres").trim();
-
-// caminho do webhook (não use /, deixe algo difícil)
 const webhookPath = `/telegraf/${WEBHOOK_SECRET}`;
 
 const server = http.createServer((req, res) => {
@@ -281,7 +370,6 @@ server.listen(PORT, async () => {
   const webhookUrl = `${PUBLIC_URL}${webhookPath}`;
 
   try {
-    // registra webhook no Telegram
     await bot.telegram.setWebhook(webhookUrl);
     console.log("✅ Webhook set:", webhookUrl);
   } catch (e) {
