@@ -1,6 +1,8 @@
+import http from "http";
 import "dotenv/config";
 import { Telegraf } from "telegraf";
 import fetch from "node-fetch";
+import FormData from "form-data";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const WORKER_BASE = (process.env.WORKER_BASE || "").replace(/\/+$/, "");
@@ -26,6 +28,7 @@ function moneyBR(v) {
   return n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
 
+// chama o worker
 async function ingestTelegram(payload) {
   const res = await fetch(`${WORKER_BASE}/api/ingest/telegram`, {
     method: "POST",
@@ -41,39 +44,30 @@ async function ingestTelegram(payload) {
   return data;
 }
 
-async function getSaldoByTelegram(telegram_id) {
-  const res = await fetch(
-    `${WORKER_BASE}/api/ingest/telegram/saldo?telegram_id=${encodeURIComponent(String(telegram_id))}`,
-    {
-      method: "GET",
-      headers: { "X-INGEST-KEY": INGEST_KEY },
-    }
-  );
-
-  const data = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(data?.message || `Erro ${res.status}`);
-  return data;
-}
-
 bot.start(async (ctx) => {
   await ctx.reply(
 `✅ BagresPlanilhador conectado!
 
-Comandos:
+1) Para vincular sua conta do site:
+• Gere o código no site (Perfil → Vincular Telegram)
+• Depois envie aqui: /vincular 123456
+
+2) Depois de vinculado:
 • +30 betano
 • -50 bet365
-• /saldo
-• /vincular 123456`
+
+📸 Envie um print do bilhete para testar leitura (modo teste).`
   );
 });
 
 // ✅ /vincular 123456
 bot.command("vincular", async (ctx) => {
   try {
-    const parts = String(ctx.message.text || "").trim().split(/\s+/);
-    const code = parts[1] || "";
-    if (!/^\d{6}$/.test(code)) {
-      await ctx.reply("❌ Use assim: /vincular 123456");
+    const parts = (ctx.message.text || "").trim().split(/\s+/);
+    const code = parts[1];
+
+    if (!code || !/^\d{6}$/.test(code)) {
+      await ctx.reply("❌ Use assim: /vincular 123456 (6 dígitos)");
       return;
     }
 
@@ -87,39 +81,80 @@ bot.command("vincular", async (ctx) => {
       telegram_username,
     });
 
-    await ctx.reply("✅ Telegram vinculado com sucesso! Agora pode lançar: +30 betano / -50 bet365");
+    await ctx.reply("✅ Telegram vinculado com sucesso! Agora pode mandar: +30 betano");
   } catch (e) {
     await ctx.reply(`❌ Erro ao vincular: ${e.message}`);
   }
 });
 
-// ✅ /saldo
-bot.command("saldo", async (ctx) => {
+// ✅ NOVO: receber FOTO e mandar pro Worker /api/ai/parse-ticket (modo teste)
+bot.on("photo", async (ctx) => {
   try {
     const telegram_id = String(ctx.from?.id || "").trim();
-    const data = await getSaldoByTelegram(telegram_id);
+    const chat_id = String(ctx.chat?.id || "").trim();
+    const message_id = String(ctx.message?.message_id || "").trim();
 
-    const s = data?.summary || {};
-    const by = data?.by_book || [];
+    // pega a melhor resolução
+    const photos = ctx.message.photo || [];
+    const best = photos[photos.length - 1];
+    if (!best?.file_id) {
+      await ctx.reply("❌ Não consegui pegar a foto. Tenta enviar de novo.");
+      return;
+    }
 
-    const lines = by.length
-      ? by.map(x => `• ${x.book}: ${moneyBR(x.balance)}`).join("\n")
-      : "• (sem movimentações)";
+    // baixa arquivo do Telegram
+    const link = await ctx.telegram.getFileLink(best.file_id);
+    const imgResp = await fetch(link.href);
+    if (!imgResp.ok) {
+      await ctx.reply("❌ Erro ao baixar a imagem do Telegram.");
+      return;
+    }
+    const buf = Buffer.from(await imgResp.arrayBuffer());
+
+    // monta multipart/form-data
+    const form = new FormData();
+    form.append("telegram_id", telegram_id);
+    form.append("chat_id", chat_id);
+    form.append("message_id", message_id);
+    form.append("image", buf, { filename: "ticket.jpg", contentType: "image/jpeg" });
+
+    // envia para o Worker
+    const res = await fetch(`${WORKER_BASE}/api/ai/parse-ticket`, {
+      method: "POST",
+      headers: {
+        "X-INGEST-KEY": INGEST_KEY,
+        ...form.getHeaders(),
+      },
+      body: form,
+    });
+
+    const data = await res.json().catch(() => null);
+
+    if (!res.ok) {
+      // caso específico: não vinculado
+      if (data?.code === "NOT_LINKED") {
+        await ctx.reply("⚠️ Seu Telegram ainda não está vinculado. Gere o código no site e use /vincular 123456.");
+        return;
+      }
+      await ctx.reply(`❌ Erro no Worker (${res.status}): ${data?.message || "Falha"}`);
+      return;
+    }
 
     await ctx.reply(
-`📊 Saldos por casa:
-${lines}
-
-🏦 Banca total: ${moneyBR(s.bankroll || 0)}`
+      `✅ Worker recebeu a imagem (modo teste)\n` +
+      `user_id: ${data.user_id}\n` +
+      `arquivo: ${data.file?.name} (${data.file?.type || "sem-type"})\n` +
+      `tamanho: ${data.file?.size} bytes`
     );
   } catch (e) {
-    await ctx.reply(`❌ Erro: ${e.message}`);
+    console.error(e);
+    await ctx.reply("❌ Deu erro ao processar a foto. Tenta novamente.");
   }
 });
 
-// ✅ +30 betano  /  -50 bet365
+// ✅ +30 betano / -50 bet365
 bot.on("text", async (ctx) => {
-  const text = String(ctx.message.text || "").trim();
+  const text = (ctx.message.text || "").trim();
   if (text.startsWith("/")) return;
 
   const m = text.match(/^([+-])\s*([\d.,]+)\s+([a-zA-Z0-9._-]{2,})$/);
@@ -134,9 +169,10 @@ bot.on("text", async (ctx) => {
     return;
   }
 
-  const type = sign === "+" ? "deposit" : "withdraw";
   const telegram_id = String(ctx.from?.id || "").trim();
   const telegram_username = String(ctx.from?.username || "").trim();
+
+  const type = sign === "+" ? "deposit" : "withdraw";
 
   try {
     await ingestTelegram({
@@ -156,8 +192,101 @@ bot.on("text", async (ctx) => {
     await ctx.reply(`❌ Erro ao registrar: ${e.message}`);
   }
 });
+bot.catch((err, ctx) => {
+  console.error("BOT ERROR:", err);
+});
 
-bot.launch();
-console.log("🤖 Bot rodando...");
+async function sendImageToWorker({ telegram_id, chat_id, message_id, fileUrl, filename }) {
+  // baixa o arquivo do Telegram
+  const imgResp = await fetch(fileUrl);
+  if (!imgResp.ok) throw new Error("Falha ao baixar imagem do Telegram");
+
+  const buf = Buffer.from(await imgResp.arrayBuffer());
+
+  const form = new FormData();
+  form.append("telegram_id", telegram_id);
+  form.append("chat_id", chat_id);
+  form.append("message_id", message_id);
+  form.append("image", buf, { filename: filename || "ticket.jpg", contentType: "image/jpeg" });
+
+  const res = await fetch(`${WORKER_BASE}/api/ai/parse-ticket`, {
+    method: "POST",
+    headers: {
+      "X-INGEST-KEY": INGEST_KEY,
+      ...form.getHeaders(),
+    },
+    body: form,
+  });
+
+  const data = await res.json().catch(() => null);
+  return { res, data };
+}
+
+// ✅ FOTO normal (galeria/câmera)
+bot.on("photo", async (ctx) => {
+  try {
+    console.log("PHOTO RECEIVED");
+    const telegram_id = String(ctx.from?.id || "").trim();
+    const chat_id = String(ctx.chat?.id || "").trim();
+    const message_id = String(ctx.message?.message_id || "").trim();
+
+    const photos = ctx.message.photo || [];
+    const best = photos[photos.length - 1];
+    if (!best?.file_id) return ctx.reply("❌ Não achei o file_id da foto.");
+
+    const link = await ctx.telegram.getFileLink(best.file_id);
+
+    const { res, data } = await sendImageToWorker({
+      telegram_id, chat_id, message_id,
+      fileUrl: link.href,
+      filename: "ticket.jpg",
+    });
+
+    if (!res.ok) {
+      console.log("WORKER ERROR:", res.status, data);
+      if (data?.code === "NOT_LINKED") {
+        return ctx.reply("⚠️ Seu Telegram não está vinculado. Use /vincular 123456.");
+      }
+      return ctx.reply(`❌ Worker erro (${res.status}): ${data?.message || "Falha"}`);
+    }
+
+    return ctx.reply(
+      `✅ Worker recebeu (teste)\nuser_id: ${data.user_id}\n` +
+      `arquivo: ${data.file?.name}\n` +
+      `tamanho: ${data.file?.size} bytes`
+
+const PORT = Number(process.env.PORT || 3000);
+const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+const WEBHOOK_SECRET = String(process.env.WEBHOOK_SECRET || "bagres").trim();
+
+// caminho do webhook (não use /, deixe algo difícil)
+const webhookPath = `/telegraf/${WEBHOOK_SECRET}`;
+
+const server = http.createServer((req, res) => {
+  if (req.url === webhookPath && req.method === "POST") {
+    return bot.webhookCallback(webhookPath)(req, res);
+  }
+  res.statusCode = 200;
+  res.end("ok");
+});
+
+server.listen(PORT, async () => {
+  console.log(`🌐 Webhook server on :${PORT} path=${webhookPath}`);
+
+  if (!PUBLIC_URL) {
+    console.log("⚠️ PUBLIC_URL não definido. Configure no Railway (Variables).");
+    return;
+  }
+
+  const webhookUrl = `${PUBLIC_URL}${webhookPath}`;
+
+  try {
+    // registra webhook no Telegram
+    await bot.telegram.setWebhook(webhookUrl);
+    console.log("✅ Webhook set:", webhookUrl);
+  } catch (e) {
+    console.error("❌ Falha ao setWebhook:", e);
+  }
+});
 
 
