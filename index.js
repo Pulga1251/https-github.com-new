@@ -14,21 +14,27 @@ if (!INGEST_KEY) throw new Error("Faltou INGEST_KEY.");
 
 const bot = new Telegraf(BOT_TOKEN);
 
+// =======================
+// Helpers
+// =======================
 function parseMoney(s) {
   const n = Number(String(s || "").replace(",", "."));
   return Number.isFinite(n) ? n : null;
 }
-
 function normalizeBook(s) {
   return String(s || "").trim().toLowerCase();
 }
-
 function moneyBR(v) {
   const n = Number(v || 0);
   return n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
+function genToken() {
+  return Math.random().toString(16).slice(2) + Date.now().toString(16);
+}
 
-// chama o worker (ingest telegram)
+// =======================
+// Worker calls
+// =======================
 async function ingestTelegram(payload) {
   const res = await fetch(`${WORKER_BASE}/api/ingest/telegram`, {
     method: "POST",
@@ -44,8 +50,7 @@ async function ingestTelegram(payload) {
   return data;
 }
 
-// ✅ helper: manda imagem pro Worker /api/ai/parse-ticket
-async function sendImageToWorker({ telegram_id, chat_id, message_id, fileUrl, filename }) {
+async function sendImageToWorker({ telegram_id, chat_id, fileUrl, filename, book_hint }) {
   const imgResp = await fetch(fileUrl);
   if (!imgResp.ok) throw new Error("Falha ao baixar imagem do Telegram");
 
@@ -54,7 +59,7 @@ async function sendImageToWorker({ telegram_id, chat_id, message_id, fileUrl, fi
   const form = new FormData();
   form.append("telegram_id", telegram_id);
   form.append("chat_id", chat_id);
-  form.append("message_id", message_id);
+  if (book_hint) form.append("book_hint", book_hint);
   form.append("image", buf, { filename: filename || "ticket.jpg", contentType: "image/jpeg" });
 
   const res = await fetch(`${WORKER_BASE}/api/ai/parse-ticket`, {
@@ -70,10 +75,33 @@ async function sendImageToWorker({ telegram_id, chat_id, message_id, fileUrl, fi
   return { res, data };
 }
 
-bot.catch((err) => {
-  console.error("BOT ERROR:", err);
-});
+// =======================
+// Batch memory (confirm A)
+// =======================
+const pendingBatches = new Map(); // token -> { telegram_id, book, items:[{extracted, summary_line}] }
+const mediaGroups = new Map();    // key -> { telegram_id, chat_id, book, items, timer }
 
+async function sendConfirmMessage(ctx, book, items, token) {
+  const lines = items
+    .map((it, idx) => `${idx + 1}) ${it.summary_line || "(sem resumo)"}`)
+    .join("\n");
+
+  await ctx.reply(
+    `📌 Casa: ${book || "(não informada)"}\n\n${lines}\n\nConfirmar tudo?`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "✅ Confirmar tudo", callback_data: `confirm:${token}` }],
+          [{ text: "❌ Cancelar", callback_data: `cancel:${token}` }],
+        ],
+      },
+    }
+  );
+}
+
+// =======================
+// Commands
+// =======================
 bot.start(async (ctx) => {
   await ctx.reply(
 `✅ BagresPlanilhador conectado!
@@ -86,11 +114,12 @@ bot.start(async (ctx) => {
 • +30 betano
 • -50 bet365
 
-📸 Envie um print do bilhete para testar leitura (modo teste).`
+📸 Para lançar por bilhete:
+Envie a foto do bilhete com a legenda = nome da casa (ex: "esportiva").`
   );
 });
 
-// ✅ /vincular 123456
+// /vincular 123456
 bot.command("vincular", async (ctx) => {
   try {
     const parts = (ctx.message.text || "").trim().split(/\s+/);
@@ -117,105 +146,9 @@ bot.command("vincular", async (ctx) => {
   }
 });
 
-// ✅ FOTO normal (galeria/câmera)
-bot.on("photo", async (ctx) => {
-  try {
-    console.log("PHOTO RECEIVED");
-
-    const telegram_id = String(ctx.from?.id || "").trim();
-    const chat_id = String(ctx.chat?.id || "").trim();
-    const message_id = String(ctx.message?.message_id || "").trim();
-
-    const photos = ctx.message.photo || [];
-    const best = photos[photos.length - 1];
-    if (!best?.file_id) {
-      await ctx.reply("❌ Não achei o file_id da foto.");
-      return;
-    }
-
-    const link = await ctx.telegram.getFileLink(best.file_id);
-
-    const { res, data } = await sendImageToWorker({
-      telegram_id,
-      chat_id,
-      message_id,
-      fileUrl: link.href,
-      filename: "ticket.jpg",
-    });
-
-    if (!res.ok) {
-      console.log("WORKER ERROR:", res.status, data);
-      if (data?.code === "NOT_LINKED") {
-        await ctx.reply("⚠️ Seu Telegram ainda não está vinculado. Use /vincular 123456.");
-        return;
-      }
-      await ctx.reply(`❌ Worker erro (${res.status}): ${data?.message || "Falha"}`);
-      return;
-    }
-
-    await ctx.reply(
-      `✅ Worker recebeu a imagem (modo teste)\n` +
-      `user_id: ${data.user_id}\n` +
-      `arquivo: ${data.file?.name} (${data.file?.type || "sem-type"})\n` +
-      `tamanho: ${data.file?.size} bytes`
-    );
-  } catch (e) {
-    console.error("PHOTO HANDLER ERROR:", e);
-    await ctx.reply("❌ Deu erro ao processar a foto. Tenta novamente.");
-  }
-});
-
-// ✅ Se a imagem for enviada como ARQUIVO (document)
-bot.on("document", async (ctx) => {
-  try {
-    console.log("DOCUMENT RECEIVED");
-
-    const telegram_id = String(ctx.from?.id || "").trim();
-    const chat_id = String(ctx.chat?.id || "").trim();
-    const message_id = String(ctx.message?.message_id || "").trim();
-
-    const doc = ctx.message.document;
-    const mime = String(doc?.mime_type || "");
-    const name = String(doc?.file_name || "ticket.jpg");
-
-    if (!mime.startsWith("image/")) {
-      await ctx.reply("📎 Recebi um arquivo, mas não parece imagem. Envie como foto/imagem.");
-      return;
-    }
-
-    const link = await ctx.telegram.getFileLink(doc.file_id);
-
-    const { res, data } = await sendImageToWorker({
-      telegram_id,
-      chat_id,
-      message_id,
-      fileUrl: link.href,
-      filename: name,
-    });
-
-    if (!res.ok) {
-      console.log("WORKER ERROR:", res.status, data);
-      if (data?.code === "NOT_LINKED") {
-        await ctx.reply("⚠️ Seu Telegram ainda não está vinculado. Use /vincular 123456.");
-        return;
-      }
-      await ctx.reply(`❌ Worker erro (${res.status}): ${data?.message || "Falha"}`);
-      return;
-    }
-
-    await ctx.reply(
-      `✅ Worker recebeu a imagem (modo teste)\n` +
-      `user_id: ${data.user_id}\n` +
-      `arquivo: ${data.file?.name} (${data.file?.type || "sem-type"})\n` +
-      `tamanho: ${data.file?.size} bytes`
-    );
-  } catch (e) {
-    console.error("DOCUMENT HANDLER ERROR:", e);
-    await ctx.reply("❌ Deu erro ao processar o arquivo. Tenta novamente.");
-  }
-});
-
-// ✅ +30 betano / -50 bet365
+// =======================
+// Wallet (+/-)
+// =======================
 bot.on("text", async (ctx) => {
   const text = (ctx.message.text || "").trim();
   if (text.startsWith("/")) return;
@@ -255,7 +188,144 @@ bot.on("text", async (ctx) => {
   }
 });
 
-// ✅ WEBHOOK (resolve 409)
+// =======================
+// Photo -> AI -> list -> confirm
+// =======================
+bot.on("photo", async (ctx) => {
+  try {
+    const telegram_id = String(ctx.from?.id || "").trim();
+    const chat_id = String(ctx.chat?.id || "").trim();
+
+    const caption = String(ctx.message.caption || "").trim(); // legenda = casa
+    const book_hint = caption ? caption.toLowerCase() : "";
+
+    const photos = ctx.message.photo || [];
+    const best = photos[photos.length - 1];
+    if (!best?.file_id) return ctx.reply("❌ Não achei o file_id.");
+
+    const link = await ctx.telegram.getFileLink(best.file_id);
+    const media_group_id = ctx.message.media_group_id ? String(ctx.message.media_group_id) : null;
+
+    const processOne = async () => {
+      const { res, data } = await sendImageToWorker({
+        telegram_id,
+        chat_id,
+        fileUrl: link.href,
+        filename: "ticket.jpg",
+        book_hint,
+      });
+
+      if (!res.ok) {
+        if (data?.code === "NOT_LINKED") {
+          await ctx.reply("⚠️ Seu Telegram não está vinculado. Use /vincular 123456.");
+          return null;
+        }
+        await ctx.reply(`❌ Erro no Worker (${res.status}): ${data?.message || "Falha"}`);
+        return null;
+      }
+      return data;
+    };
+
+    // ✅ 1 foto
+    if (!media_group_id) {
+      const one = await processOne();
+      if (!one) return;
+
+      const token = genToken();
+      pendingBatches.set(token, {
+        telegram_id,
+        book: book_hint,
+        items: [{ extracted: one.extracted, summary_line: one.summary_line }],
+      });
+
+      return sendConfirmMessage(ctx, book_hint, pendingBatches.get(token).items, token);
+    }
+
+    // ✅ álbum: acumula e fecha após 1.2s sem novas fotos
+    const key = `${chat_id}:${media_group_id}`;
+    let g = mediaGroups.get(key);
+    if (!g) {
+      g = { telegram_id, chat_id, book: book_hint, items: [], timer: null };
+      mediaGroups.set(key, g);
+    }
+    if (book_hint) g.book = book_hint;
+
+    const one = await processOne();
+    if (one) g.items.push({ extracted: one.extracted, summary_line: one.summary_line });
+
+    if (g.timer) clearTimeout(g.timer);
+    g.timer = setTimeout(async () => {
+      mediaGroups.delete(key);
+
+      const token = genToken();
+      pendingBatches.set(token, {
+        telegram_id: g.telegram_id,
+        book: g.book,
+        items: g.items,
+      });
+
+      await sendConfirmMessage(ctx, g.book, g.items, token);
+    }, 1200);
+
+  } catch (e) {
+    console.error(e);
+    await ctx.reply("❌ Erro ao processar foto.");
+  }
+});
+
+// =======================
+// Confirm / Cancel actions
+// =======================
+bot.action(/^confirm:(.+)$/i, async (ctx) => {
+  try {
+    const token = ctx.match[1];
+    const batch = pendingBatches.get(token);
+    if (!batch) {
+      await ctx.answerCbQuery("Esse lote expirou.");
+      return;
+    }
+
+    await ctx.answerCbQuery("Gravando...");
+
+    const res = await fetch(`${WORKER_BASE}/api/ingest/telegram`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-INGEST-KEY": INGEST_KEY },
+      body: JSON.stringify({
+        kind: "bets_create",
+        telegram_id: batch.telegram_id,
+        items: batch.items.map((x) => x.extracted),
+      }),
+    });
+
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(data?.message || `Erro ${res.status}`);
+
+    pendingBatches.delete(token);
+
+    const okCount = (data.results || []).filter((r) => r.ok).length;
+    const failCount = (data.results || []).filter((r) => !r.ok).length;
+
+    await ctx.editMessageText(`✅ Lote gravado!\nOK: ${okCount}\nFalhas: ${failCount}`);
+  } catch (e) {
+    await ctx.answerCbQuery("Erro");
+    await ctx.reply(`❌ Falha ao gravar: ${e.message}`);
+  }
+});
+
+bot.action(/^cancel:(.+)$/i, async (ctx) => {
+  const token = ctx.match[1];
+  pendingBatches.delete(token);
+  await ctx.answerCbQuery("Cancelado");
+  try { await ctx.editMessageText("❌ Lote cancelado."); } catch {}
+});
+
+bot.catch((err) => {
+  console.error("BOT ERROR:", err);
+});
+
+// =======================
+// Webhook server (resolve 409)
+// =======================
 const PORT = Number(process.env.PORT || 3000);
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
 const WEBHOOK_SECRET = String(process.env.WEBHOOK_SECRET || "bagres").trim();
@@ -278,7 +348,6 @@ server.listen(PORT, async () => {
   }
 
   const webhookUrl = `${PUBLIC_URL}${webhookPath}`;
-
   try {
     await bot.telegram.setWebhook(webhookUrl);
     console.log("✅ Webhook set:", webhookUrl);
@@ -286,4 +355,3 @@ server.listen(PORT, async () => {
     console.error("❌ Falha ao setWebhook:", e);
   }
 });
-
