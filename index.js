@@ -21,9 +21,21 @@ function parseMoney(s) {
   const n = Number(String(s || "").replace(",", "."));
   return Number.isFinite(n) ? n : null;
 }
-function normalizeBook(s) {
-  return String(s || "").trim().toLowerCase();
+
+function slugifyBook(raw) {
+  let s = String(raw || "").trim().toLowerCase();
+  try {
+    s = s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  } catch {}
+  s = s.replace(/&/g, "e");
+  s = s.replace(/[^a-z0-9]+/g, "");
+  return s;
 }
+
+function normalizeBook(s) {
+  return slugifyBook(s);
+}
+
 function moneyBR(v) {
   const n = Number(v || 0);
   return n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
@@ -78,25 +90,157 @@ async function sendImageToWorker({ telegram_id, chat_id, fileUrl, filename, book
 // =======================
 // Batch memory (confirm A)
 // =======================
-const pendingBatches = new Map(); // token -> { telegram_id, book, items:[{extracted, summary_line}] }
-const mediaGroups = new Map();    // key -> { telegram_id, chat_id, book, items, timer }
+const pendingBatches = new Map(); // token -> { telegram_id, book, items:[{extracted, summary_}] }
+const mediaGroups = new Map();
+const pendingEdits = new Map();  // chat_id -> { token, index }
+    // key -> { telegram_id, chat_id, book, items, timer }
+
+
+function summarizeExtracted(x) {
+  const event = (x?.event || "").toString().trim();
+  const market = (x?.market || "").toString().trim();
+  const  = (x?. || "").toString().trim();
+  const odd = (x?.odd ?? "").toString().trim();
+  const stake = (x?.stake ?? "").toString().trim();
+  const sport = (x?.sport || "").toString().trim();
+
+  let s = `${event || "(sem jogo)"} — ${market || "(sem mercado)"}`;
+  if () s += ` ${}`;
+  if (odd) s += ` (odd ${odd})`;
+  if (stake) s += ` • stake ${stake}`;
+  if (sport) s += ` • ${sport}`;
+  return s;
+}
+
+function applyEditToExtracted(original, text) {
+  // formato: jogo | mercado | linha | odd | stake | esporte | casa(opcional)
+  const parts = String(text || "").split("|").map(s => s.trim());
+  const out = { ...(original || {}) };
+
+  const keys = ["event","market","odd","stake","sport","book"];
+  for (let i=0;i<keys.length && i<parts.length;i++){
+    if (parts[i] !== "") out[keys[i]] = parts[i];
+  }
+  // ajustes numéricos
+  if (out.odd !== undefined) out.odd = Number(String(out.odd).replace(",", "."));
+  if (out.stake !== undefined) out.stake = Number(String(out.stake).replace(",", "."));
+  return out;
+}
+
+
+async function renderBatchReview(ctx, token, opts = {}) {
+  const batch = pendingBatches.get(token);
+  if (!batch) {
+    try { await ctx.answerCbQuery?.("Esse lote expirou."); } catch {}
+    return;
+  }
+
+  const total = (batch.items || []).length;
+  const lines = [];
+  lines.push(`📌 *Revisão do lote*`);
+  lines.push(`🏷️ Casa: *${(batch.book || "—")}*`);
+  lines.push(`📦 Itens: *${total}*`);
+  lines.push("");
+
+  if (total === 0) {
+    lines.push("⚠️ Nenhum item no lote.");
+  } else {
+    for (let i = 0; i < total; i++) {
+      const it = batch.items[i];
+      const s = it?.summary_line || summarizeExtracted(it?.extracted || {});
+      const tag = it?.has_error ? "❌" : "✅";
+      lines.push(`*${i + 1})* ${tag} ${s}`);
+    }
+  }
+
+  const kb = [];
+  kb.push([{ text: "✅ Confirmar tudo", callback_data: `confirm:${token}` }]);
+  kb.push([{ text: "✏️ Editar", callback_data: `editmenu:${token}` }]);
+  kb.push([{ text: "❌ Cancelar", callback_data: `cancel:${token}` }]);
+
+  const payload = {
+    parse_mode: "Markdown",
+    reply_markup: { inline_keyboard: kb },
+  };
+
+  try {
+    if (typeof ctx.editMessageText === "function" && ctx.updateType === "callback_query") {
+      await ctx.editMessageText(lines.join("\n"), payload);
+      return;
+    }
+  } catch {}
+  await ctx.reply(lines.join("\n"), payload);
+}
 
 async function sendConfirmMessage(ctx, book, items, token) {
-  const lines = items
-    .map((it, idx) => `${idx + 1}) ${it.summary_line || "(sem resumo)"}`)
-    .join("\n");
+  try { pendingBatches.set(token, { ...(pendingBatches.get(token) || {}), book, items }); } catch {}
+  return renderBatchReview(ctx, token);
+}
 
-  await ctx.reply(
-    `📌 Casa: ${book || "(não informada)"}\n\n${lines}\n\nConfirmar tudo?`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "✅ Confirmar tudo", callback_data: `confirm:${token}` }],
-          [{ text: "❌ Cancelar", callback_data: `cancel:${token}` }],
-        ],
-      },
-    }
-  );
+async function renderEditMenu(ctx, token) {
+  const batch = pendingBatches.get(token);
+  if (!batch) { try { await ctx.answerCbQuery?.("Esse lote expirou."); } catch {} return; }
+
+  const total = (batch.items || []).length;
+  const lines = [];
+  lines.push(`✏️ *Editar lote*`);
+  lines.push(`Escolha a aposta para editar:`);
+
+  const kb = [];
+  for (let i = 0; i < total; i++) {
+    const it = batch.items[i];
+    const s = it?.summary_line || summarizeExtracted(it?.extracted || {});
+    const short = s.length > 40 ? s.slice(0, 40) + "…" : s;
+    kb.push([{ text: `Aposta ${i + 1}`, callback_data: `pick:${token}:${i}` }, { text: "🗑 Remover", callback_data: `remove:${token}:${i}` }]);
+  }
+  kb.push([{ text: "⬅️ Voltar", callback_data: `reviewhome:${token}` }]);
+
+  const payload = { parse_mode: "Markdown", reply_markup: { inline_keyboard: kb } };
+  try {
+    await ctx.editMessageText(lines.join("\n"), payload);
+  } catch {
+    await ctx.reply(lines.join("\n"), payload);
+  }
+}
+
+async function renderEditFields(ctx, token, index) {
+  const batch = pendingBatches.get(token);
+  if (!batch) { try { await ctx.answerCbQuery?.("Esse lote expirou."); } catch {} return; }
+  const it = batch.items[index];
+  if (!it) { try { await ctx.answerCbQuery?.("Item inválido."); } catch {} return; }
+
+  const ex = it.extracted || {};
+  const lines = [];
+  lines.push(`🛠️ *Editar Aposta ${index + 1}*`);
+  lines.push(`Casa: *${ex.book || batch.book || "—"}*`);
+  lines.push(`Descrição: *${ex.event || "—"}*`);
+  lines.push(`Mercado: *${ex.market || "—"}*`);
+  lines.push(`Odd: *${ex.odd ?? "—"}*`);
+  lines.push(`Stake: *${ex.stake ?? "—"}*`);
+  lines.push(`Esporte: *${ex.sport || "—"}*`);
+  lines.push("");
+  lines.push("Clique no campo para alterar:");
+
+  const kb = [
+    [{ text: "Casa", callback_data: `field:${token}:${index}:book` },
+     { text: "Descrição", callback_data: `field:${token}:${index}:event` }],
+    [{ text: "Mercado", callback_data: `field:${token}:${index}:market` },
+     { text: "Odd", callback_data: `field:${token}:${index}:odd` }],
+    [{ text: "Stake", callback_data: `field:${token}:${index}:stake` },
+     { text: "Esporte", callback_data: `field:${token}:${index}:sport` }],
+    [{ text: "⬅️ Voltar", callback_data: `editmenu:${token}` }],
+  ];
+
+  const payload = { parse_mode: "Markdown", reply_markup: { inline_keyboard: kb } };
+  try { await ctx.editMessageText(lines.join("\n"), payload); }
+  catch { await ctx.reply(lines.join("\n"), payload); }
+}
+
+
+async function sendConfirmMessageasync function sendConfirmMessage(ctx, book, items, token) {
+  // Compat: agora usamos a revisão visual
+  try { pendingBatches.set(token, { ...(pendingBatches.get(token) || {}), book, items }); } catch {}
+  return renderBatchReview(ctx, token, { page: 0 });
 }
 
 // =======================
@@ -153,6 +297,48 @@ bot.on("text", async (ctx) => {
   const text = (ctx.message.text || "").trim();
   if (text.startsWith("/")) return;
 
+  // se está em modo edição (campo específico)
+  const chatKey = String(ctx.chat?.id || "");
+  const pe = pendingEdits.get(chatKey);
+  if (pe) {
+    const batch = pendingBatches.get(pe.token);
+    if (!batch || !batch.items[pe.index]) {
+      pendingEdits.delete(chatKey);
+      await ctx.reply("⚠️ Não achei esse lote/item. Envie a foto de novo.");
+      return;
+    }
+
+    const it = batch.items[pe.index];
+    const cur = it.extracted || {};
+    const valRaw = text;
+
+    const field = pe.field;
+    const updated = { ...cur };
+
+    if (field === "book") updated.book = normalizeBook(valRaw);
+    else if (field === "event") updated.event = valRaw;
+    else if (field === "market") updated.market = valRaw;
+    else if (field === "sport") updated.sport = valRaw;
+    else if (field === "odd") updated.odd = Number(String(valRaw).replace(",", "."));
+    else if (field === "stake") updated.stake = Number(String(valRaw).replace(",", "."));
+    else {
+      // fallback: mantém formato antigo "jogo | mercado | odd | stake | esporte | casa"
+      const tmp = applyEditToExtracted(cur, valRaw);
+      Object.assign(updated, tmp);
+    }
+
+    it.extracted = updated;
+    it.summary_ = summarizeExtracted(updated);
+
+    pendingEdits.delete(chatKey);
+
+    await ctx.reply("✅ Atualizado!");
+    // volta para tela de campos do item
+    await renderEditFields(ctx, pe.token, pe.index);
+    return;
+  }
+
+
   const m = text.match(/^([+-])\s*([\d.,]+)\s+([a-zA-Z0-9._-]{2,})$/);
   if (!m) return;
 
@@ -197,7 +383,7 @@ bot.on("photo", async (ctx) => {
     const chat_id = String(ctx.chat?.id || "").trim();
 
     const caption = String(ctx.message.caption || "").trim(); // legenda = casa
-    const book_hint = caption ? caption.toLowerCase() : "";
+    const book_hint = caption ? normalizeBook(caption) : "";
 
     const photos = ctx.message.photo || [];
     const best = photos[photos.length - 1];
@@ -235,7 +421,7 @@ bot.on("photo", async (ctx) => {
       pendingBatches.set(token, {
         telegram_id,
         book: book_hint,
-        items: [{ extracted: one.extracted, summary_line: one.summary_line }],
+        items: [{ extracted: one.extracted, summary_: one.summary_ }],
       });
 
       return sendConfirmMessage(ctx, book_hint, pendingBatches.get(token).items, token);
@@ -251,7 +437,7 @@ bot.on("photo", async (ctx) => {
     if (book_hint) g.book = book_hint;
 
     const one = await processOne();
-    if (one) g.items.push({ extracted: one.extracted, summary_line: one.summary_line });
+    if (one) g.items.push({ extracted: one.extracted, summary_: one.summary_ });
 
     if (g.timer) clearTimeout(g.timer);
     g.timer = setTimeout(async () => {
@@ -270,6 +456,99 @@ bot.on("photo", async (ctx) => {
   } catch (e) {
     console.error(e);
     await ctx.reply("❌ Erro ao processar foto.");
+  }
+});
+
+
+
+// =======================
+// Edit menu actions (lote e 1 foto)
+// =======================
+bot.action(/^reviewhome:(.+)$/i, async (ctx) => {
+  try {
+    const token = ctx.match[1];
+    await ctx.answerCbQuery("Ok");
+    await renderBatchReview(ctx, token);
+  } catch {}
+});
+
+bot.action(/^editmenu:(.+)$/i, async (ctx) => {
+  try {
+    const token = ctx.match[1];
+    await ctx.answerCbQuery("Editar");
+    await renderEditMenu(ctx, token);
+  } catch (e) {
+    try { await ctx.answerCbQuery("Erro"); } catch {}
+  }
+});
+
+bot.action(/^pick:(.+):(\d+)$/i, async (ctx) => {
+  try {
+    const token = ctx.match[1];
+    const index = Number(ctx.match[2]);
+    await ctx.answerCbQuery(`Aposta ${index + 1}`);
+    await renderEditFields(ctx, token, index);
+  } catch {
+    try { await ctx.answerCbQuery("Erro"); } catch {}
+  }
+});
+
+bot.action(/^field:(.+):(\d+):([a-z]+)$/i, async (ctx) => {
+  try {
+    const token = ctx.match[1];
+    const index = Number(ctx.match[2]);
+    const field = String(ctx.match[3] || "").toLowerCase();
+
+    const chatKey = String(ctx.chat?.id || "");
+    pendingEdits.set(chatKey, { token, index, field });
+
+    const labels = {
+      book: "Casa",
+      event: "Descrição",
+      market: "Mercado",
+      odd: "Odd",
+      stake: "Stake",
+      sport: "Esporte",
+    };
+
+    await ctx.answerCbQuery("Digite o novo valor");
+    await ctx.reply(`✍️ Envie o novo valor para *${labels[field] || field}* (Aposta ${index + 1}).`, { parse_mode: "Markdown" });
+  } catch (e) {
+    try { await ctx.answerCbQuery("Erro"); } catch {}
+  }
+});
+
+bot.action(/^review:(.+):(\d+)$/i, async (ctx) => {
+  try {
+    const token = ctx.match[1];
+    const page = Number(ctx.match[2] || 0);
+    const batch = pendingBatches.get(token);
+    if (!batch) { await ctx.answerCbQuery("Esse lote expirou."); return; }
+    await ctx.answerCbQuery("Ok");
+    await renderBatchReview(ctx, token, { page });
+  } catch (e) {
+    try { await ctx.answerCbQuery("Erro"); } catch {}
+  }
+});
+
+bot.action(/^remove:(.+):(\d+)$/i, async (ctx) => {
+  try {
+    const token = ctx.match[1];
+    const index = Number(ctx.match[2]);
+    const batch = pendingBatches.get(token);
+    if (!batch) { await ctx.answerCbQuery("Esse lote expirou."); return; }
+    if (!batch.items || !batch.items[index]) { await ctx.answerCbQuery("Item inválido."); return; }
+
+    batch.items.splice(index, 1);
+    // recomputa summary_line se necessário
+    batch.items.forEach((it) => {
+      it.summary_line = it.summary_line || summarizeExtracted(it.extracted || {});
+    });
+
+    await ctx.answerCbQuery("Removido");
+    await renderBatchReview(ctx, token, { page: 0 });
+  } catch (e) {
+    try { await ctx.answerCbQuery("Erro"); } catch {}
   }
 });
 
