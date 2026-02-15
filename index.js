@@ -92,7 +92,42 @@ async function sendImageToWorker({ telegram_id, chat_id, fileUrl, filename, book
 // =======================
 const pendingBatches = new Map(); // token -> { telegram_id, book, items:[{extracted, summary_}] }
 const mediaGroups = new Map();
-const pendingEdits = new Map();  // chat_id -> { token, index }
+const pendingEdits = new Map();
+const chatReviewSessions = new Map(); // chat_id -> { telegram_id, book, items, timer }
+
+// Junta todas as fotos enviadas em sequência (mesmo fora de álbum) em UM único "Revisão do lote"
+function queueReviewItem(ctx, { telegram_id, chat_id, book_hint, item }) {
+  const key = String(chat_id);
+  let s = chatReviewSessions.get(key);
+  if (!s) {
+    s = { telegram_id, chat_id, book: book_hint || "", items: [], timer: null };
+    chatReviewSessions.set(key, s);
+  }
+  // mantém a última casa enviada como "hint" do lote, mas cada item também carrega sua própria casa no resumo
+  if (book_hint) s.book = book_hint;
+  s.items.push(item);
+
+  if (s.timer) clearTimeout(s.timer);
+  s.timer = setTimeout(async () => {
+    chatReviewSessions.delete(key);
+
+    const token = genToken();
+    pendingBatches.set(token, {
+      telegram_id: s.telegram_id,
+      book: s.book,
+      items: s.items,
+    });
+
+    const fakeCtx = {
+      chat: { id: s.chat_id },
+      telegram: ctx.telegram,
+      reply: (text, payload) => ctx.telegram.sendMessage(s.chat_id, text, payload),
+    };
+
+    await renderBatchReview(fakeCtx, token, { page: 0 });
+  }, 1200);
+}
+  // chat_id -> { token, index }
     // key -> { telegram_id, chat_id, book, items, timer }
 
 
@@ -405,46 +440,16 @@ bot.on("photo", async (ctx) => {
       return data;
     };
 
-    // ✅ 1 foto
-    if (!media_group_id) {
-      const one = await processOne();
-      if (!one) return;
-
-      const token = genToken();
-      pendingBatches.set(token, {
-        telegram_id,
-        book: book_hint,
-        items: [{ extracted: one.extracted, summary_: one.summary_ }],
-      });
-
-      return sendConfirmMessage(ctx, book_hint, pendingBatches.get(token).items, token);
-    }
-
-    // ✅ álbum: acumula e fecha após 1.2s sem novas fotos
-    const key = `${chat_id}:${media_group_id}`;
-    let g = mediaGroups.get(key);
-    if (!g) {
-      g = { telegram_id, chat_id, book: book_hint, items: [], timer: null };
-      mediaGroups.set(key, g);
-    }
-    if (book_hint) g.book = book_hint;
-
+    // ✅ Agrupa todas as fotos em um único lote (1 foto ou várias)
     const one = await processOne();
-    if (one) g.items.push({ extracted: one.extracted, summary_: one.summary_ });
+    if (!one) return;
 
-    if (g.timer) clearTimeout(g.timer);
-    g.timer = setTimeout(async () => {
-      mediaGroups.delete(key);
-
-      const token = genToken();
-      pendingBatches.set(token, {
-        telegram_id: g.telegram_id,
-        book: g.book,
-        items: g.items,
-      });
-
-      await sendConfirmMessage(ctx, g.book, g.items, token);
-    }, 1200);
+    queueReviewItem(ctx, {
+      telegram_id,
+      chat_id,
+      book_hint,
+      item: { extracted: one.extracted, summary_: one.summary_ },
+    });
 
   } catch (e) {
     console.error(e);
