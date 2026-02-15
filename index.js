@@ -347,6 +347,46 @@ bot.on("text", async (ctx) => {
     const repliedId = ctx.message?.reply_to_message?.message_id;
     if (!repliedId || repliedId !== pe.reply_to) return;
 
+
+    // Edição por campo (botões)
+    if (pe.mode === "field") {
+      const batch = pendingBatches.get(pe.token);
+      const item = batch?.items?.[pe.index];
+      if (!batch || !item) return;
+
+      const raw = (textIn || "").trim();
+      const val = raw === "-" ? "" : raw;
+
+      switch (pe.field) {
+        case "book":
+          item.book = val ? normalizeBook(val) : "";
+          break;
+        case "event":
+          item.event = val;
+          break;
+        case "market":
+          item.market = val;
+          break;
+        case "odd":
+          item.odd = val ? Number(String(val).replace(",", ".")) : null;
+          break;
+        case "stake":
+          item.stake = val ? Number(String(val).replace(",", ".")) : null;
+          break;
+        case "sport":
+          item.sport = val;
+          break;
+        default:
+          // fallback: salva em event
+          item.event = val;
+      }
+
+      pendingEdits.delete(key);
+      await ctx.reply("✅ Atualizado.");
+      await renderBatchReview(ctx, batch);
+      return;
+    }
+
     const batch = pendingBatches.get(pe.token);
     if (!batch || !batch.items[pe.index]) {
       pendingEdits.delete(chatKey);
@@ -470,44 +510,81 @@ bot.action(/^edit:(.+):(\d+)$/i, async (ctx) => {
     }
     await ctx.answerCbQuery("Editar");
 
-    const it = batch.items[index];
-    const x = it.extracted || {};
+    const kb = Markup.inlineKeyboard([
+      [
+        Markup.button.callback("🏷️ Casa", `ef:${token}:${index}:book`),
+        Markup.button.callback("🧾 Descrição", `ef:${token}:${index}:event`)
+      ],
+      [
+        Markup.button.callback("📌 Mercado", `ef:${token}:${index}:market`),
+        Markup.button.callback("📈 Odd", `ef:${token}:${index}:odd`)
+      ],
+      [
+        Markup.button.callback("💰 Stake", `ef:${token}:${index}:stake`),
+        Markup.button.callback("🏅 Esporte", `ef:${token}:${index}:sport`)
+      ],
+      [Markup.button.callback("⬅️ Voltar", `eback:${token}`)]
+    ]);
 
-    const formText =
-`✏️ *Editar aposta ${index + 1}*
-Responda *esta mensagem* mantendo o formato (pode apagar o que não quiser mudar):
-
-Casa: ${x.book || batch.book || ""}
-Descrição: ${x.event || ""}
-Mercado: ${x.market || ""}
-Odd: ${x.odd ?? ""}
-Stake: ${x.stake ?? ""}
-Esporte: ${x.sport || ""}
-
-_Dica: só edite o valor depois dos dois pontos._`;
-
-    const chatKey = String(ctx.chat?.id || "");
-    const msg = await ctx.reply(formText, {
-      parse_mode: "Markdown",
-      reply_markup: { force_reply: true },
-    });
-
-    pendingEdits.set(chatKey, { token, index, reply_to: msg.message_id });
+    await ctx.reply(
+      `✏️ Editar aposta ${index + 1}\nEscolha o campo:`,
+      { ...kb }
+    );
   } catch (e) {
-    try { await ctx.answerCbQuery("Erro"); } catch {}
+    console.error("edit action error", e);
+    try { await ctx.answerCbQuery("Erro ao abrir edição."); } catch {}
   }
 });
 
-bot.action(/^review:(.+):(\d+)$/i, async (ctx) => {
+bot.action(/^eback:(.+)$/i, async (ctx) => {
   try {
     const token = ctx.match[1];
-    const page = Number(ctx.match[2] || 0);
     const batch = pendingBatches.get(token);
-    if (!batch) { await ctx.answerCbQuery("Esse lote expirou."); return; }
+    if (batch) await renderBatchReview(ctx, batch);
     await ctx.answerCbQuery("Ok");
-    await renderBatchReview(ctx, token, { page });
+    // opcional: tenta apagar o menu
+    try { await ctx.deleteMessage(); } catch {}
   } catch (e) {
-    try { await ctx.answerCbQuery("Erro"); } catch {}
+    console.error("eback error", e);
+  }
+});
+
+bot.action(/^ef:(.+):(\d+):([a-z_]+)$/i, async (ctx) => {
+  try {
+    const token = ctx.match[1];
+    const index = Number(ctx.match[2]);
+    const field = String(ctx.match[3]);
+
+    const batch = pendingBatches.get(token);
+    if (!batch || !batch.items || !batch.items[index]) {
+      await ctx.answerCbQuery("Esse item expirou.");
+      return;
+    }
+
+    const label = ({
+      book: "Casa",
+      event: "Descrição",
+      market: "Mercado",
+      odd: "Odd",
+      stake: "Stake",
+      sport: "Esporte",
+    })[field] || field;
+
+    await ctx.answerCbQuery(`Editar: ${label}`);
+
+    const chatId = ctx.chat?.id;
+    const telegram_id = ctx.from?.id;
+    if (!chatId || !telegram_id) return;
+
+    const key = `${chatId}:${telegram_id}`;
+    const promptMsg = await ctx.reply(
+      `✍️ Envie o novo valor para *${label}* (ou \`-\` pra limpar):`,
+      { parse_mode: "Markdown", reply_markup: { force_reply: true } }
+    );
+    pendingEdits.set(key, { token, index, mode: "field", field, reply_to: promptMsg.message_id });
+  } catch (e) {
+    console.error("ef action error", e);
+    try { await ctx.answerCbQuery("Erro ao iniciar edição."); } catch {}
   }
 });
 
