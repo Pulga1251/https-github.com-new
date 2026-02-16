@@ -4,6 +4,14 @@ import { Telegraf, Markup } from "telegraf";
 import fetch from "node-fetch";
 import FormData from "form-data";
 
+// Evita crash silencioso: erros não tratados viram log no Railway
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception:", err);
+});
+
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const WORKER_BASE = (process.env.WORKER_BASE || "").replace(/\/+$/, "");
 const INGEST_KEY = String(process.env.INGEST_KEY || "").replace(/[\r\n\t]/g, "").trim();
@@ -394,7 +402,6 @@ bot.on("text", async (ctx) => {
       item.summary_ = summarizeExtracted(ex);
 
       pendingEdits.delete(chatKey);
-      const batch = pendingBatches.get(pe.token);
       await ctx.reply(`✅ Salvo com sucesso.`);
       await renderBatchReview(ctx, pe.token, { page: 0, editMessageId: batch?.review_message_id });
       return;
@@ -414,7 +421,6 @@ bot.on("text", async (ctx) => {
     batch.items[pe.index].summary_ = summarizeExtracted(updated);
 
     pendingEdits.delete(chatKey);
-    const batch = pendingBatches.get(pe.token);
     await ctx.reply("✅ Atualizado! Vou te mostrar o lote atualizado:");
     await renderBatchReview(ctx, pe.token, { page: 0, editMessageId: batch?.review_message_id });
     return;
@@ -593,11 +599,12 @@ bot.on("document", async (ctx) => {
       await ctx.reply("❌ Não consegui ler o bilhete. Envie como foto (não como arquivo) ou tente outra imagem.");
       return;
     }
+    const summary = data.summary_ ?? summarizeExtracted(data.extracted || {});
     queueReviewItem(ctx, {
       telegram_id,
       chat_id,
       book_hint,
-      item: { extracted: data.extracted, summary_: data.summary_ },
+      item: { extracted: data.extracted, summary_: summary },
     });
   } catch (e) {
     console.error("document (image) handler error:", e);
@@ -861,19 +868,17 @@ const server = http.createServer((req, res) => {
   res.end("ok");
 });
 
-server.listen(PORT, async () => {
+server.listen(PORT, () => {
   console.log(`🌐 Webhook server on :${PORT} path=${webhookPath}`);
+});
 
-  if (!PUBLIC_URL) {
-    console.log("⚠️ PUBLIC_URL não definido. Configure no Railway (Variables).");
-    return;
-  }
-
-  const webhookUrl = `${PUBLIC_URL}${webhookPath}`;
+// setWebhook em segundo plano (falha não derruba o processo)
+(async () => {
+  if (!PUBLIC_URL) return;
   try {
-    await bot.telegram.setWebhook(webhookUrl);
-    console.log("✅ Webhook set:", webhookUrl);
+    await bot.telegram.setWebhook(`${PUBLIC_URL}${webhookPath}`);
+    console.log("✅ Webhook set:", `${PUBLIC_URL}${webhookPath}`);
   } catch (e) {
     console.error("❌ Falha ao setWebhook:", e);
   }
-});
+})();
