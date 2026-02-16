@@ -1,6 +1,6 @@
 import http from "http";
 import "dotenv/config";
-import { Telegraf, Markup } from "telegraf";
+import { Telegraf } from "telegraf";
 import fetch from "node-fetch";
 import FormData from "form-data";
 
@@ -127,13 +127,9 @@ function queueReviewItem(ctx, { telegram_id, chat_id, book_hint, item }) {
       telegram: ctx.telegram,
       reply: (text, payload) => ctx.telegram.sendMessage(s.chat_id, text, payload),
     };
-    try {
-      await renderBatchReview(fakeCtx, token, { page: 0 });
-    } catch (e) {
-      console.error("queueReviewItem render error:", e);
-      try { await ctx.telegram.sendMessage(s.chat_id, "❌ Erro ao montar revisão. Tente enviar de novo."); } catch {}
-    }
-  }, 3000);
+
+    await renderBatchReview(fakeCtx, token, { page: 0 });
+  }, 1200);
 }
   // chat_id -> { token, index }
     // key -> { telegram_id, chat_id, book, items, timer }
@@ -249,9 +245,11 @@ async function renderBatchReview(ctx, token, opts = {}) {
 
   if (total > 0) {
     for (let i = start; i < end; i++) {
-      kb.push([{ text: `🗑 Remover ${i + 1}`, callback_data: `remove:${token}:${i}` }]);
+      kb.push([
+        { text: `✏️ Editar ${i + 1}`, callback_data: `edit:${token}:${i}` },
+        { text: `🗑 Remover ${i + 1}`, callback_data: `remove:${token}:${i}` },
+      ]);
     }
-    kb.push([{ text: "✏️ Editar", callback_data: `edit:${token}` }]);
   }
 
   const nav = [];
@@ -271,13 +269,10 @@ async function renderBatchReview(ctx, token, opts = {}) {
   try {
     if (editMessageId && ctx.telegram && ctx.chat?.id) {
       await ctx.telegram.editMessageText(ctx.chat.id, editMessageId, null, lines.join("\n"), payload);
-      batch.review_message_id = editMessageId;
       return;
     }
     if (typeof ctx.editMessageText === "function" && ctx.updateType === "callback_query") {
       await ctx.editMessageText(lines.join("\n"), payload);
-      const msgId = ctx.callbackQuery?.message?.message_id;
-      if (msgId) batch.review_message_id = msgId;
       return;
     }
   } catch (e) {
@@ -349,7 +344,7 @@ bot.on("text", async (ctx) => {
   if (text.startsWith("/")) return;
 
   // se está em modo edição de bilhete (EDITAR = formulário numa única mensagem)
-  const chatKey = `${ctx.chat?.id}:${ctx.from?.id}`;
+  const chatKey = String(ctx.chat?.id || "");
   const pe = pendingEdits.get(chatKey);
   if (pe) {
     // só aceita se for resposta ao "formulário" que o bot mandou
@@ -394,9 +389,8 @@ bot.on("text", async (ctx) => {
       item.summary_ = summarizeExtracted(ex);
 
       pendingEdits.delete(chatKey);
-      const batch = pendingBatches.get(pe.token);
-      await ctx.reply(`✅ Salvo com sucesso.`);
-      await renderBatchReview(ctx, pe.token, { page: 0, editMessageId: batch?.review_message_id });
+      await ctx.reply("✅ Atualizado!");
+      await renderBatchReview(ctx, pe.token, { page: 0 });
       return;
     }
 
@@ -414,9 +408,9 @@ bot.on("text", async (ctx) => {
     batch.items[pe.index].summary_ = summarizeExtracted(updated);
 
     pendingEdits.delete(chatKey);
-    const batch = pendingBatches.get(pe.token);
+
     await ctx.reply("✅ Atualizado! Vou te mostrar o lote atualizado:");
-    await renderBatchReview(ctx, pe.token, { page: 0, editMessageId: batch?.review_message_id });
+    await renderBatchReview(ctx, pe.token, { page: 0 });
     return;
   }
 
@@ -462,23 +456,23 @@ bot.on("photo", async (ctx) => {
   try {
     const telegram_id = String(ctx.from?.id || "").trim();
     const chat_id = String(ctx.chat?.id || "").trim();
-    const caption = String(ctx.message.caption || "").trim();
+
+    const caption = String(ctx.message.caption || "").trim(); // legenda = casa
     const book_hint = caption ? normalizeBook(caption) : "";
 
     const photos = ctx.message.photo || [];
     const best = photos[photos.length - 1];
-    if (!best?.file_id) {
-      await ctx.reply("❌ Não achei o file_id da imagem.");
-      return;
-    }
+    if (!best?.file_id) return ctx.reply("❌ Não achei o file_id.");
 
     const media_group_id = ctx.message.media_group_id ? String(ctx.message.media_group_id) : null;
 
-    const processMessage = async (msg, hint, telegramCtx) => {
+    // Helper: processa UMA mensagem de foto
+    const processMessage = async (msg, hint) => {
       const photosM = msg.photo || [];
       const bestM = photosM[photosM.length - 1];
       if (!bestM?.file_id) return null;
-      const linkM = await telegramCtx.telegram.getFileLink(bestM.file_id);
+      const linkM = await ctx.telegram.getFileLink(bestM.file_id);
+
       const { res, data } = await sendImageToWorker({
         telegram_id,
         chat_id,
@@ -486,67 +480,49 @@ bot.on("photo", async (ctx) => {
         filename: "ticket.jpg",
         book_hint: hint,
       });
+
       if (!res.ok) {
         if (data?.code === "NOT_LINKED") {
-          await telegramCtx.reply("⚠️ Seu Telegram não está vinculado. Use /vincular 123456.");
+          await ctx.reply("⚠️ Seu Telegram não está vinculado. Use /vincular 123456.");
           return null;
         }
-        await telegramCtx.reply(`❌ Erro no Worker (${res.status}): ${data?.message || "Falha ao ler bilhete."}`);
+        await ctx.reply(`❌ Erro no Worker (${res.status}): ${data?.message || "Falha"}`);
         return null;
       }
       return data;
     };
 
+    // ✅ Se for álbum (media_group_id), bufferiza e processa tudo junto (1 revisão)
     if (media_group_id) {
       const entry = pendingMediaGroups.get(media_group_id) || { ctx, messages: [] };
       entry.ctx = ctx;
       entry.messages.push({ msg: ctx.message, hint: book_hint });
       pendingMediaGroups.set(media_group_id, entry);
+
       clearTimeout(pendingMediaGroupTimers.get(media_group_id));
       const t = setTimeout(async () => {
-        const entry = pendingMediaGroups.get(media_group_id);
+        const e = pendingMediaGroups.get(media_group_id);
         pendingMediaGroups.delete(media_group_id);
         pendingMediaGroupTimers.delete(media_group_id);
-        const telegramCtx = entry?.ctx || ctx;
-        try {
-          if (!entry?.messages?.length) return;
-          try { await telegramCtx.reply("🧠 Lendo lote..."); } catch {}
+        if (!e || !e.messages?.length) return;
 
-          const bookHint = entry.messages[0]?.hint || "";
-          const items = [];
-          for (const { msg, hint } of entry.messages) {
-            try {
-              const r = await processMessage(msg, hint || bookHint, telegramCtx);
-              if (r && r.extracted) items.push({ extracted: r.extracted, summary_: r.summary_ });
-            } catch (e) {
-              console.error("mediaGroup item error:", e);
-              await telegramCtx.reply(`❌ Erro em uma foto do lote: ${e.message || "tente de novo."}`).catch(() => {});
-            }
-          }
-          if (!items.length) {
-            await telegramCtx.reply("❌ Não consegui ler esse lote. Tente fotos mais nítidas ou envie uma por vez.");
-            return;
-          }
-          const token = genToken();
-          pendingBatches.set(token, {
-            telegram_id: telegramCtx.from.id,
-            chat_id: telegramCtx.chat.id,
-            book: bookHint,
-            items,
-            review_message_id: null,
+        for (const it of e.messages) {
+          const out = await processMessage(it.msg, it.hint);
+          if (!out) continue;
+          queueReviewItem(e.ctx, {
+            telegram_id,
+            chat_id,
+            book_hint: it.hint,
+            item: { extracted: out.extracted, summary_: out.summary_ },
           });
-          await renderBatchReview(telegramCtx, token);
-        } catch (e) {
-          console.error("mediaGroup timeout error:", e);
-          try { await telegramCtx.reply("❌ Erro ao processar o lote. Tente enviar as fotos de novo (uma por vez ou em álbum)."); } catch {}
         }
       }, 900);
       pendingMediaGroupTimers.set(media_group_id, t);
       return;
     }
 
-    await ctx.reply("🔄 Processando bilhete...").catch(() => {});
-    const one = await processMessage(ctx.message, book_hint, ctx);
+    // ✅ Foto única
+    const one = await processMessage(ctx.message, book_hint);
     if (!one) return;
 
     queueReviewItem(ctx, {
@@ -555,143 +531,51 @@ bot.on("photo", async (ctx) => {
       book_hint,
       item: { extracted: one.extracted, summary_: one.summary_ },
     });
+
   } catch (e) {
-    console.error("photo handler error:", e);
-    try { await ctx.reply("❌ Erro ao processar foto. Tente de novo ou envie com legenda (ex: betano)."); } catch {}
+    console.error(e);
+    await ctx.reply("❌ Erro ao processar foto.");
   }
 });
 
-// Imagem enviada como arquivo (documento) — mesmo fluxo do bilhete
-bot.on("document", async (ctx) => {
-  const doc = ctx.message?.document;
-  if (!doc?.file_id) return;
-  const mime = (doc.mime_type || "").toLowerCase();
-  if (!mime.startsWith("image/")) return;
-  try {
-    await ctx.reply("🔄 Processando bilhete...").catch(() => {});
-    const telegram_id = String(ctx.from?.id || "").trim();
-    const chat_id = String(ctx.chat?.id || "").trim();
-    const caption = String(ctx.message?.caption || "").trim();
-    const book_hint = caption ? normalizeBook(caption) : "";
-    const link = await ctx.telegram.getFileLink(doc.file_id);
-    const { res, data } = await sendImageToWorker({
-      telegram_id,
-      chat_id,
-      fileUrl: link.href,
-      filename: doc.file_name || "ticket.jpg",
-      book_hint,
-    });
-    if (!res.ok) {
-      if (data?.code === "NOT_LINKED") {
-        await ctx.reply("⚠️ Seu Telegram não está vinculado. Use /vincular 123456.");
-        return;
-      }
-      await ctx.reply(`❌ Erro no Worker (${res.status}): ${data?.message || "Falha ao ler bilhete."}`);
-      return;
-    }
-    if (!data?.extracted) {
-      await ctx.reply("❌ Não consegui ler o bilhete. Envie como foto (não como arquivo) ou tente outra imagem.");
-      return;
-    }
-    queueReviewItem(ctx, {
-      telegram_id,
-      chat_id,
-      book_hint,
-      item: { extracted: data.extracted, summary_: data.summary_ },
-    });
-  } catch (e) {
-    console.error("document (image) handler error:", e);
-    try { await ctx.reply("❌ Erro ao processar imagem. Tente enviar como foto (câmera/galeria) com legenda da casa."); } catch {}
-  }
-});
 
-// edit:token — foto única: mostra campos direto; lote: mostra Aposta 1, Aposta 2...
-bot.action(/^review:(.+):(\d+)$/i, async (ctx) => {
-  try {
-    const token = ctx.match[1];
-    const page = Number(ctx.match[2]);
-    const batch = pendingBatches.get(token);
-    if (!batch) {
-      await ctx.answerCbQuery("Esse lote expirou.");
-      return;
-    }
-    await ctx.answerCbQuery("");
-    await renderBatchReview(ctx, token, { page, editMessageId: batch.review_message_id });
-  } catch (e) {
-    try { await ctx.answerCbQuery("Erro"); } catch {}
-  }
-});
 
-// editpick deve vir antes de edit para o regex não engolir editpick:token:index
-bot.action(/^editpick:(.+):(\d+)$/i, async (ctx) => {
+bot.action(/^edit:(.+):(\d+)$/i, async (ctx) => {
   try {
     const token = ctx.match[1];
     const index = Number(ctx.match[2]);
     const batch = pendingBatches.get(token);
-    if (!batch || !batch.items?.[index]) {
+    if (!batch || !batch.items || !batch.items[index]) {
       await ctx.answerCbQuery("Esse item expirou.");
       return;
     }
     await ctx.answerCbQuery("Editar");
-    await sendFieldButtons(ctx, token, index);
-  } catch (e) {
-    console.error("editpick action error", e);
-    try { await ctx.answerCbQuery("Erro."); } catch {}
-  }
-});
 
-bot.action(/^edit:(.+)$/i, async (ctx) => {
-  try {
-    const token = ctx.match[1].trim();
-    if (!token) return ctx.answerCbQuery("Token inválido.");
-    const batch = pendingBatches.get(token);
-    if (!batch || !batch.items?.length) {
-      await ctx.answerCbQuery("Esse lote expirou.");
-      return;
-    }
-    await ctx.answerCbQuery("Editar");
+    const kb = Markup.inlineKeyboard([
+      [
+        Markup.button.callback("🏷️ Casa", `ef:${token}:${index}:book`),
+        Markup.button.callback("🧾 Descrição", `ef:${token}:${index}:event`)
+      ],
+      [
+        Markup.button.callback("📌 Mercado", `ef:${token}:${index}:market`),
+        Markup.button.callback("📈 Odd", `ef:${token}:${index}:odd`)
+      ],
+      [
+        Markup.button.callback("💰 Stake", `ef:${token}:${index}:stake`),
+        Markup.button.callback("🏅 Esporte", `ef:${token}:${index}:sport`)
+      ],
+      [Markup.button.callback("⬅️ Voltar", `eback:${token}`)]
+    ]);
 
-    const total = batch.items.length;
-
-    if (total === 1) {
-      await sendFieldButtons(ctx, token, 0);
-      return;
-    }
-
-    const rows = [];
-    for (let i = 0; i < total; i++) {
-      rows.push([Markup.button.callback(`Aposta ${i + 1}`, `editpick:${token}:${i}`)]);
-    }
-    rows.push([Markup.button.callback("⬅️ Voltar", `eback:${token}`)]);
-    await ctx.reply("✏️ Qual aposta deseja editar?", {
-      reply_markup: { inline_keyboard: rows },
-    });
+    await ctx.reply(
+      `✏️ Editar aposta ${index + 1}\nEscolha o campo:`,
+      { ...kb }
+    );
   } catch (e) {
     console.error("edit action error", e);
     try { await ctx.answerCbQuery("Erro ao abrir edição."); } catch {}
   }
 });
-
-function sendFieldButtons(ctx, token, index) {
-  const rows = [
-    [
-      Markup.button.callback("🏷️ Casa", `ef:${token}:${index}:book`),
-      Markup.button.callback("🧾 Descrição", `ef:${token}:${index}:event`),
-    ],
-    [
-      Markup.button.callback("📌 Mercado", `ef:${token}:${index}:market`),
-      Markup.button.callback("📈 Odds", `ef:${token}:${index}:odd`),
-    ],
-    [
-      Markup.button.callback("💰 Stake", `ef:${token}:${index}:stake`),
-      Markup.button.callback("🏅 Esporte", `ef:${token}:${index}:sport`),
-    ],
-    [Markup.button.callback("⬅️ Voltar", `eback:${token}`)],
-  ];
-  return ctx.reply("✏️ Escolha o campo para editar:", {
-    reply_markup: { inline_keyboard: rows },
-  });
-}
 
 bot.action(/^eback:(.+)$/i, async (ctx) => {
   try {
@@ -705,26 +589,6 @@ bot.action(/^eback:(.+)$/i, async (ctx) => {
     console.error("eback error", e);
   }
 });
-
-
-const EDIT_FIELD_UI = {
-  book:   { label: "Casa",      prompt: "Qual é o nome da casa de apostas?" },
-  stake:  { label: "Stake",     prompt: "Qual valor da sua stake?" },
-  event:  { label: "Descrição", prompt: "Qual a descrição correta da aposta?" },
-  market: { label: "Mercado",   prompt: "Qual mercado? (ex: Ambas marcam, Over 2.5, ML)" },
-  odd:    { label: "Odds",      prompt: "Qual a odd?" },
-  sport:  { label: "Esporte",   prompt: "Qual esporte? (Futebol, NBA, Tênis...)" },
-};
-
-function fieldLabel(field) {
-  return (EDIT_FIELD_UI[field] && EDIT_FIELD_UI[field].label) ? EDIT_FIELD_UI[field].label : field;
-}
-
-function fieldPrompt(field) {
-  const ui = EDIT_FIELD_UI[field];
-  if (!ui) return `✏️ ${field}\nDigite o novo valor.`;
-  return `✏️ ${ui.label}\n${ui.prompt}`;
-}
 
 bot.action(/^ef:(.+):(\d+):([a-z_]+)$/i, async (ctx) => {
   try {
@@ -754,11 +618,10 @@ bot.action(/^ef:(.+):(\d+):([a-z_]+)$/i, async (ctx) => {
     if (!chatId || !telegram_id) return;
 
     const key = `${chatId}:${telegram_id}`;
-    const promptText = fieldPrompt(field);
-    const promptMsg = await ctx.reply(promptText + "\n\n_(Envie o valor ou_ `-` _para limpar)_", {
-      parse_mode: "Markdown",
-      reply_markup: { force_reply: true },
-    });
+    const promptMsg = await ctx.reply(
+      `✍️ Envie o novo valor para *${label}* (ou \`-\` pra limpar):`,
+      { parse_mode: "Markdown", reply_markup: { force_reply: true } }
+    );
     pendingEdits.set(key, { token, index, mode: "field", field, reply_to: promptMsg.message_id });
   } catch (e) {
     console.error("ef action error", e);
@@ -775,12 +638,13 @@ bot.action(/^remove:(.+):(\d+)$/i, async (ctx) => {
     if (!batch.items || !batch.items[index]) { await ctx.answerCbQuery("Item inválido."); return; }
 
     batch.items.splice(index, 1);
+    // recomputa summary_line se necessário
     batch.items.forEach((it) => {
       it.summary_line = it.summary_line || summarizeExtracted(it.extracted || {});
     });
 
     await ctx.answerCbQuery("Removido");
-    await renderBatchReview(ctx, token, { page: 0, editMessageId: batch.review_message_id });
+    await renderBatchReview(ctx, token, { page: 0 });
   } catch (e) {
     try { await ctx.answerCbQuery("Erro"); } catch {}
   }
@@ -790,47 +654,38 @@ bot.action(/^remove:(.+):(\d+)$/i, async (ctx) => {
 // Confirm / Cancel actions
 // =======================
 bot.action(/^confirm:(.+)$/i, async (ctx) => {
-  const token = (ctx.match[1] || "").trim();
-  const batch = token ? pendingBatches.get(token) : null;
-
   try {
+    const token = ctx.match[1];
+    const batch = pendingBatches.get(token);
     if (!batch) {
       await ctx.answerCbQuery("Esse lote expirou.");
       return;
     }
 
     await ctx.answerCbQuery("Gravando...");
-    pendingBatches.delete(token); // evita double-submit
-
-    const payload = {
-      kind: "bets_create",
-      telegram_id: batch.telegram_id,
-      items: (batch.items || []).map((x) => x.extracted),
-    };
 
     const res = await fetch(`${WORKER_BASE}/api/ingest/telegram`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-INGEST-KEY": INGEST_KEY },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        kind: "bets_create",
+        telegram_id: batch.telegram_id,
+        items: batch.items.map((x) => x.extracted),
+      }),
     });
 
-    const data = await res.json().catch(() => ({}));
-    const msg = data?.message || data?.error || (res.ok ? null : `HTTP ${res.status}`);
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(data?.message || `Erro ${res.status}`);
 
-    if (!res.ok) {
-      await ctx.editMessageText(`❌ Não foi possível gravar.`);
-      await ctx.reply(`❌ Erro: ${msg || "Tente de novo mais tarde."}`);
-      return;
-    }
+    pendingBatches.delete(token);
+
     const okCount = (data.results || []).filter((r) => r.ok).length;
     const failCount = (data.results || []).filter((r) => !r.ok).length;
-    const text = failCount > 0
-      ? `✅ Gravado!\nOK: ${okCount}\nFalhas: ${failCount}`
-      : `✅ Lote gravado com sucesso! (${okCount} aposta${okCount !== 1 ? "s" : ""})`;
-    await ctx.editMessageText(text);
+
+    await ctx.editMessageText(`✅ Lote gravado!\nOK: ${okCount}\nFalhas: ${failCount}`);
   } catch (e) {
-    try { await ctx.answerCbQuery("Erro"); } catch {}
-    await ctx.reply(`❌ Falha ao gravar: ${e.message || "Erro inesperado. Tente de novo."}`);
+    await ctx.answerCbQuery("Erro");
+    await ctx.reply(`❌ Falha ao gravar: ${e.message}`);
   }
 });
 
