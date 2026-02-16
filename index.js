@@ -402,6 +402,7 @@ bot.on("text", async (ctx) => {
       item.summary_ = summarizeExtracted(ex);
 
       pendingEdits.delete(chatKey);
+      try { await ctx.telegram.deleteMessage(ctx.chat.id, pe.reply_to); } catch {}
       await ctx.reply(`✅ Salvo com sucesso.`);
       await renderBatchReview(ctx, pe.token, { page: 0, editMessageId: batch?.review_message_id });
       return;
@@ -704,9 +705,8 @@ bot.action(/^eback:(.+)$/i, async (ctx) => {
   try {
     const token = ctx.match[1];
     const batch = pendingBatches.get(token);
-    if (batch) await renderBatchReview(ctx, token, { page: 0 });
+    if (batch) await renderBatchReview(ctx, token, { page: 0, editMessageId: batch.review_message_id });
     try { await ctx.answerCbQuery("Ok"); } catch {}
-    // opcional: tenta apagar o menu
     try { await ctx.deleteMessage(); } catch {}
   } catch (e) {
     console.error("eback error", e);
@@ -824,8 +824,9 @@ bot.action(/^confirm:(.+)$/i, async (ctx) => {
     const data = await res.json().catch(() => ({}));
     const msg = data?.message || data?.error || (res.ok ? null : `HTTP ${res.status}`);
 
+    const noButtons = { reply_markup: { inline_keyboard: [] } };
     if (!res.ok) {
-      await ctx.editMessageText(`❌ Não foi possível gravar.`);
+      await ctx.editMessageText(`❌ Não foi possível gravar.`, noButtons);
       await ctx.reply(`❌ Erro: ${msg || "Tente de novo mais tarde."}`);
       return;
     }
@@ -834,7 +835,7 @@ bot.action(/^confirm:(.+)$/i, async (ctx) => {
     const text = failCount > 0
       ? `✅ Gravado!\nOK: ${okCount}\nFalhas: ${failCount}`
       : `✅ Lote gravado com sucesso! (${okCount} aposta${okCount !== 1 ? "s" : ""})`;
-    await ctx.editMessageText(text);
+    await ctx.editMessageText(text, noButtons);
   } catch (e) {
     try { await ctx.answerCbQuery("Erro"); } catch {}
     await ctx.reply(`❌ Falha ao gravar: ${e.message || "Erro inesperado. Tente de novo."}`);
@@ -845,7 +846,9 @@ bot.action(/^cancel:(.+)$/i, async (ctx) => {
   const token = ctx.match[1];
   pendingBatches.delete(token);
   await ctx.answerCbQuery("Cancelado");
-  try { await ctx.editMessageText("❌ Lote cancelado."); } catch {}
+  try {
+    await ctx.editMessageText("❌ Lote cancelado.", { reply_markup: { inline_keyboard: [] } });
+  } catch {}
 });
 
 bot.catch((err) => {
