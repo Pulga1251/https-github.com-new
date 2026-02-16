@@ -402,7 +402,7 @@ bot.on("text", async (ctx) => {
       item.summary_ = summarizeExtracted(ex);
 
       pendingEdits.delete(chatKey);
-      try { await ctx.telegram.deleteMessage(ctx.chat.id, pe.reply_to); } catch {}
+      if (pe.reply_to) try { await ctx.telegram.deleteMessage(ctx.chat.id, pe.reply_to); } catch {}
       await ctx.reply(`✅ Salvo com sucesso.`);
       await renderBatchReview(ctx, pe.token, { page: 0, editMessageId: batch?.review_message_id });
       return;
@@ -641,7 +641,7 @@ bot.action(/^editpick:(.+):(\d+)$/i, async (ctx) => {
       return;
     }
     await ctx.answerCbQuery("Editar");
-    await sendFieldButtons(ctx, token, index);
+    await sendFieldButtonsEdit(ctx, token, index);
   } catch (e) {
     console.error("editpick action error", e);
     try { await ctx.answerCbQuery("Erro."); } catch {}
@@ -662,7 +662,7 @@ bot.action(/^edit:(.+)$/i, async (ctx) => {
     const total = batch.items.length;
 
     if (total === 1) {
-      await sendFieldButtons(ctx, token, 0);
+      await sendFieldButtonsEdit(ctx, token, 0);
       return;
     }
 
@@ -671,7 +671,7 @@ bot.action(/^edit:(.+)$/i, async (ctx) => {
       rows.push([Markup.button.callback(`Aposta ${i + 1}`, `editpick:${token}:${i}`)]);
     }
     rows.push([Markup.button.callback("⬅️ Voltar", `eback:${token}`)]);
-    await ctx.reply("✏️ Qual aposta deseja editar?", {
+    await ctx.editMessageText("✏️ Qual aposta deseja editar?", {
       reply_markup: { inline_keyboard: rows },
     });
   } catch (e) {
@@ -680,7 +680,7 @@ bot.action(/^edit:(.+)$/i, async (ctx) => {
   }
 });
 
-function sendFieldButtons(ctx, token, index) {
+function sendFieldButtonsEdit(ctx, token, index) {
   const rows = [
     [
       Markup.button.callback("🏷️ Casa", `ef:${token}:${index}:book`),
@@ -696,7 +696,7 @@ function sendFieldButtons(ctx, token, index) {
     ],
     [Markup.button.callback("⬅️ Voltar", `eback:${token}`)],
   ];
-  return ctx.reply("✏️ Escolha o campo para editar:", {
+  return ctx.editMessageText("✏️ Escolha o campo para editar:", {
     reply_markup: { inline_keyboard: rows },
   });
 }
@@ -707,7 +707,6 @@ bot.action(/^eback:(.+)$/i, async (ctx) => {
     const batch = pendingBatches.get(token);
     if (batch) await renderBatchReview(ctx, token, { page: 0, editMessageId: batch.review_message_id });
     try { await ctx.answerCbQuery("Ok"); } catch {}
-    try { await ctx.deleteMessage(); } catch {}
   } catch (e) {
     console.error("eback error", e);
   }
@@ -761,15 +760,28 @@ bot.action(/^ef:(.+):(\d+):([a-z_]+)$/i, async (ctx) => {
     if (!chatId || !telegram_id) return;
 
     const key = `${chatId}:${telegram_id}`;
-    const promptText = fieldPrompt(field);
-    const promptMsg = await ctx.reply(promptText + "\n\n_(Envie o valor ou_ `-` _para limpar)_", {
-      parse_mode: "Markdown",
-      reply_markup: { force_reply: true },
+    const promptText = fieldPrompt(field) + "\n\n(Envie o valor ou - para limpar)";
+    const cancelRow = [[Markup.button.callback("⬅️ Cancelar", `efback:${token}:${index}`)]];
+    await ctx.editMessageText(promptText, {
+      reply_markup: { inline_keyboard: cancelRow },
     });
-    pendingEdits.set(key, { token, index, mode: "field", field, reply_to: promptMsg.message_id });
+    pendingEdits.set(key, { token, index, mode: "field", field, reply_to: null });
   } catch (e) {
     console.error("ef action error", e);
     try { await ctx.answerCbQuery("Erro ao iniciar edição."); } catch {}
+  }
+});
+
+bot.action(/^efback:(.+):(\d+)$/i, async (ctx) => {
+  try {
+    const token = ctx.match[1];
+    const index = Number(ctx.match[2]);
+    const key = `${ctx.chat?.id}:${ctx.from?.id}`;
+    pendingEdits.delete(key);
+    await ctx.answerCbQuery("Ok");
+    await sendFieldButtonsEdit(ctx, token, index);
+  } catch (e) {
+    try { await ctx.answerCbQuery("Erro"); } catch {}
   }
 });
 
