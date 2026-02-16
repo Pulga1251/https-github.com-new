@@ -95,6 +95,10 @@ const mediaGroups = new Map();
 const pendingEdits = new Map();
 const chatReviewSessions = new Map(); // chat_id -> { telegram_id, book, items, timer }
 
+// Telegram álbum (media_group_id): buffer para processar tudo junto e evitar 3 mensagens de revisão
+const pendingMediaGroups = new Map(); // mediaGroupId -> { ctx, messages: [] }
+const pendingMediaGroupTimers = new Map();
+
 // Junta todas as fotos enviadas em sequência (mesmo fora de álbum) em UM único "Revisão do lote"
 function queueReviewItem(ctx, { telegram_id, chat_id, book_hint, item }) {
   const key = String(chat_id);
@@ -354,36 +358,39 @@ bot.on("text", async (ctx) => {
       const item = batch?.items?.[pe.index];
       if (!batch || !item) return;
 
-      const raw = (textIn || "").trim();
+      const raw = (text || "").trim();
       const val = raw === "-" ? "" : raw;
 
+      const ex = item.extracted || {};
       switch (pe.field) {
         case "book":
-          item.book = val ? normalizeBook(val) : "";
+          ex.book = val ? normalizeBook(val) : "";
           break;
         case "event":
-          item.event = val;
+          ex.event = val;
           break;
         case "market":
-          item.market = val;
+          ex.market = val;
           break;
         case "odd":
-          item.odd = val ? Number(String(val).replace(",", ".")) : null;
+          ex.odd = val ? Number(String(val).replace(",", ".")) : null;
           break;
         case "stake":
-          item.stake = val ? Number(String(val).replace(",", ".")) : null;
+          ex.stake = val ? Number(String(val).replace(",", ".")) : null;
           break;
         case "sport":
-          item.sport = val;
+          ex.sport = val;
           break;
         default:
-          // fallback: salva em event
-          item.event = val;
+          ex.event = val;
       }
 
-      pendingEdits.delete(key);
-      await ctx.reply("✅ Atualizado.");
-      await renderBatchReview(ctx, batch);
+      item.extracted = ex;
+      item.summary_ = summarizeExtracted(ex);
+
+      pendingEdits.delete(chatKey);
+      await ctx.reply("✅ Atualizado!");
+      await renderBatchReview(ctx, pe.token, { page: 0 });
       return;
     }
 
@@ -457,16 +464,21 @@ bot.on("photo", async (ctx) => {
     const best = photos[photos.length - 1];
     if (!best?.file_id) return ctx.reply("❌ Não achei o file_id.");
 
-    const link = await ctx.telegram.getFileLink(best.file_id);
     const media_group_id = ctx.message.media_group_id ? String(ctx.message.media_group_id) : null;
 
-    const processOne = async () => {
+    // Helper: processa UMA mensagem de foto
+    const processMessage = async (msg, hint) => {
+      const photosM = msg.photo || [];
+      const bestM = photosM[photosM.length - 1];
+      if (!bestM?.file_id) return null;
+      const linkM = await ctx.telegram.getFileLink(bestM.file_id);
+
       const { res, data } = await sendImageToWorker({
         telegram_id,
         chat_id,
-        fileUrl: link.href,
+        fileUrl: linkM.href,
         filename: "ticket.jpg",
-        book_hint,
+        book_hint: hint,
       });
 
       if (!res.ok) {
@@ -480,8 +492,37 @@ bot.on("photo", async (ctx) => {
       return data;
     };
 
-    // ✅ Agrupa todas as fotos em um único lote (1 foto ou várias)
-    const one = await processOne();
+    // ✅ Se for álbum (media_group_id), bufferiza e processa tudo junto (1 revisão)
+    if (media_group_id) {
+      const entry = pendingMediaGroups.get(media_group_id) || { ctx, messages: [] };
+      entry.ctx = ctx;
+      entry.messages.push({ msg: ctx.message, hint: book_hint });
+      pendingMediaGroups.set(media_group_id, entry);
+
+      clearTimeout(pendingMediaGroupTimers.get(media_group_id));
+      const t = setTimeout(async () => {
+        const e = pendingMediaGroups.get(media_group_id);
+        pendingMediaGroups.delete(media_group_id);
+        pendingMediaGroupTimers.delete(media_group_id);
+        if (!e || !e.messages?.length) return;
+
+        for (const it of e.messages) {
+          const out = await processMessage(it.msg, it.hint);
+          if (!out) continue;
+          queueReviewItem(e.ctx, {
+            telegram_id,
+            chat_id,
+            book_hint: it.hint,
+            item: { extracted: out.extracted, summary_: out.summary_ },
+          });
+        }
+      }, 900);
+      pendingMediaGroupTimers.set(media_group_id, t);
+      return;
+    }
+
+    // ✅ Foto única
+    const one = await processMessage(ctx.message, book_hint);
     if (!one) return;
 
     queueReviewItem(ctx, {
@@ -540,8 +581,8 @@ bot.action(/^eback:(.+)$/i, async (ctx) => {
   try {
     const token = ctx.match[1];
     const batch = pendingBatches.get(token);
-    if (batch) await renderBatchReview(ctx, batch);
-    await ctx.answerCbQuery("Ok");
+    if (batch) await renderBatchReview(ctx, token, { page: 0 });
+    try { await ctx.answerCbQuery("Ok"); } catch {}
     // opcional: tenta apagar o menu
     try { await ctx.deleteMessage(); } catch {}
   } catch (e) {
