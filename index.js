@@ -124,10 +124,12 @@ function queueReviewItem(ctx, { telegram_id, chat_id, book_hint, item }) {
     chatReviewSessions.delete(key);
 
     const token = genToken();
+    // garante que cada item tenha match_date já para exibição/edição
+    const itemsWithDate = (s.items || []).map(it => ({ ...it, extracted: ensureExtractedHasDate(it.extracted || {}) }));
     pendingBatches.set(token, {
       telegram_id: s.telegram_id,
       book: s.book,
-      items: s.items,
+      items: itemsWithDate,
     });
 
     const fakeCtx = {
@@ -246,6 +248,7 @@ function parseEditForm(text) {
   const odd = pick("Odd");
   const stake = pick("Stake");
   const esporte = pick("Esporte");
+  const data = pick("Data");
 
   if (casa) out.book = casa;
   if (desc) out.event = desc; // usamos event como "descrição/jogo"
@@ -253,6 +256,31 @@ function parseEditForm(text) {
   if (odd) out.odd = Number(String(odd).replace(",", "."));
   if (stake) out.stake = Number(String(stake).replace(",", "."));
   if (esporte) out.sport = esporte;
+  if (data) {
+    // tenta normalizar para YYYY-MM-DD
+    const rawv = data.trim();
+    let parsed = null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(rawv)) {
+      parsed = new Date(rawv);
+    } else {
+      const mm = rawv.match(/(\d{1,2})[\/\-](\d{1,2})([\/\-](\d{2,4}))?/);
+      if (mm) {
+        let day = parseInt(mm[1], 10);
+        let month = parseInt(mm[2], 10) - 1;
+        let year = mm[3] ? parseInt(mm[3].replace(/^\D+/,""), 10) : (new Date()).getFullYear();
+        if (year < 100) year += 2000;
+        parsed = new Date(year, month, day);
+      }
+    }
+    if (parsed && !Number.isNaN(parsed.getTime())) {
+      const y = parsed.getFullYear();
+      const m = String(parsed.getMonth() + 1).padStart(2, "0");
+      const d = String(parsed.getDate()).padStart(2, "0");
+      out.match_date = `${y}-${m}-${d}`;
+    } else {
+      out.match_date = rawv;
+    }
+  }
 
   return out;
 }
@@ -307,8 +335,11 @@ async function renderBatchReview(ctx, token, opts = {}) {
   } else {
     for (let i = start; i < end; i++) {
       const it = batch.items[i];
-      const s = it?.summary_line || summarizeExtracted(it?.extracted || {});
-      lines.push(`*${i + 1})* ${s}`);
+      const ex = it?.extracted || {};
+      const s = it?.summary_line || summarizeExtracted(ex);
+      const missingSport = !ex?.sport;
+      const sportNote = missingSport ? " • Esporte: (não detectado)" : "";
+      lines.push(`*${i + 1})* ${s}${sportNote}`);
     }
   }
   if (pages > 1) lines.push(`\nPágina ${p + 1}/${pages}`);
@@ -444,6 +475,34 @@ bot.on("text", async (ctx) => {
           break;
         case "market":
           ex.market = val;
+          break;
+        case "date":
+          {
+            // aceita dd/mm[/yyyy] ou yyyy-mm-dd
+            const rawv = val.trim();
+            let parsed = null;
+            if (/^\d{4}-\d{2}-\d{2}$/.test(rawv)) {
+              parsed = new Date(rawv);
+            } else {
+              const mm = rawv.match(/(\d{1,2})[\/\-](\d{1,2})([\/\-](\d{2,4}))?/);
+              if (mm) {
+                let day = parseInt(mm[1], 10);
+                let month = parseInt(mm[2], 10) - 1;
+                let year = mm[3] ? parseInt(mm[3].replace(/^\D+/,""), 10) : (new Date()).getFullYear();
+                if (year < 100) year += 2000;
+                parsed = new Date(year, month, day);
+              }
+            }
+            if (parsed && !Number.isNaN(parsed.getTime())) {
+              const y = parsed.getFullYear();
+              const m = String(parsed.getMonth() + 1).padStart(2, "0");
+              const d = String(parsed.getDate()).padStart(2, "0");
+              ex.match_date = `${y}-${m}-${d}`;
+            } else {
+              // se valor inválido, armazena raw
+              ex.match_date = rawv;
+            }
+          }
           break;
         case "odd":
           ex.odd = val ? Number(String(val).replace(",", ".")) : null;
@@ -595,11 +654,12 @@ bot.on("photo", async (ctx) => {
             return;
           }
           const token = genToken();
+          const itemsWithDate = (items || []).map(it => ({ ...it, extracted: ensureExtractedHasDate(it.extracted || {}) }));
           pendingBatches.set(token, {
             telegram_id: telegramCtx.from.id,
             chat_id: telegramCtx.chat.id,
             book: bookHint,
-            items,
+            items: itemsWithDate,
             review_message_id: null,
           });
           await renderBatchReview(telegramCtx, token);
@@ -754,6 +814,9 @@ function sendFieldButtonsEdit(ctx, token, index) {
       Markup.button.callback("💰 Stake", `ef:${token}:${index}:stake`),
       Markup.button.callback("🏅 Esporte", `ef:${token}:${index}:sport`),
     ],
+    [
+      Markup.button.callback("📅 Data", `ef:${token}:${index}:date`),
+    ],
     [Markup.button.callback("⬅️ Voltar", `eback:${token}`)],
   ];
   return ctx.editMessageText("✏️ Escolha o campo para editar:", {
@@ -780,6 +843,7 @@ const EDIT_FIELD_UI = {
   market: { label: "Mercado",   prompt: "Qual mercado? (ex: Ambas marcam, Over 2.5, ML)" },
   odd:    { label: "Odds",      prompt: "Qual a odd?" },
   sport:  { label: "Esporte",   prompt: "Qual esporte? (Futebol, NBA, Tênis...)" },
+  date:   { label: "Data",      prompt: "Qual a data do jogo? (dd/mm/aaaa ou yyyy-mm-dd)" },
 };
 
 function fieldLabel(field) {
@@ -811,6 +875,7 @@ bot.action(/^ef:(.+):(\d+):([a-z_]+)$/i, async (ctx) => {
       odd: "Odd",
       stake: "Stake",
       sport: "Esporte",
+      date: "Data",
     })[field] || field;
 
     await ctx.answerCbQuery(`Editar: ${label}`);
@@ -821,11 +886,9 @@ bot.action(/^ef:(.+):(\d+):([a-z_]+)$/i, async (ctx) => {
 
     const key = `${chatId}:${telegram_id}`;
     const promptText = fieldPrompt(field) + "\n\n(Envie o valor ou - para limpar)";
-    const cancelRow = [[Markup.button.callback("⬅️ Cancelar", `efback:${token}:${index}`)]];
-    await ctx.editMessageText(promptText, {
-      reply_markup: { inline_keyboard: cancelRow },
-    });
-    pendingEdits.set(key, { token, index, mode: "field", field, reply_to: null });
+    // envia mensagem pedindo reply (force_reply) para facilitar captura
+    const promptMsg = await ctx.reply(promptText, { parse_mode: "Markdown", reply_markup: { force_reply: true } });
+    pendingEdits.set(key, { token, index, mode: "field", field, reply_to: promptMsg.message_id });
   } catch (e) {
     console.error("ef action error", e);
     try { await ctx.answerCbQuery("Erro ao iniciar edição."); } catch {}
@@ -879,6 +942,14 @@ bot.action(/^confirm:(.+)$/i, async (ctx) => {
     }
 
     await ctx.answerCbQuery("Gravando...");
+    // checa se alguma aposta não tem esporte
+    const missing = (batch.items || []).map((it, idx) => ({ idx, ex: it.extracted || {} })).filter(x => !x.ex.sport);
+    if (missing.length) {
+      // não permite confirmar, pede para editar esportes faltantes
+      await ctx.editMessageText(`⚠️ Não posso confirmar: ${missing.length} item(s) sem *Esporte* definido.\nUse *Editar* → *Esporte* para preencher.`, { parse_mode: "Markdown", reply_markup: { inline_keyboard: [] } });
+      await ctx.reply(`Itens sem esporte: ${missing.map(m => `#${m.idx + 1}`).join(", ")}. Clique em *Editar* na revisão e adicione o Esporte.`, { parse_mode: "Markdown" });
+      return;
+    }
     pendingBatches.delete(token); // evita double-submit
 
     const payload = {
