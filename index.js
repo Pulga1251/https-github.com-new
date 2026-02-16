@@ -156,11 +156,71 @@ function summarizeExtracted(x) {
   const book = (x?.book || "").toString().trim();
 
   let s = `${event || "(sem jogo)"} — ${market || "(sem mercado)"}`;
+  // inclui data da partida se presente (match_date no formato YYYY-MM-DD)
+  if (x?.match_date) {
+    try {
+      const parts = String(x.match_date).split("-");
+      if (parts.length >= 3) {
+        const dd = parts[2].padStart(2, "0");
+        const mm = parts[1].padStart(2, "0");
+        const yy = parts[0];
+        s = `${s} • ${dd}/${mm}/${yy}`;
+      } else {
+        s = `${s} • ${String(x.match_date)}`;
+      }
+    } catch (e) {
+      s = `${s} • ${String(x.match_date)}`;
+    }
+  }
   if (odd) s += ` (odd ${odd})`;
   if (stake) s += ` • stake ${stake}`;
   if (sport) s += ` • ${sport}`;
   if (book) s += ` • ${book}`;
   return s;
+}
+
+// Garantir que cada aposta tenha uma data clara antes de enviar ao Worker.
+// Regras:
+// - Se o objeto extraído já contém `date`, `match_date` ou `day`, tenta parsear e usar no formato YYYY-MM-DD.
+// - Se não houver data reconhecível, assume a data de hoje (no timezone do servidor) para evitar lançamentos em dia aleatório.
+function ensureExtractedHasDate(ex) {
+  const obj = { ...(ex || {}) };
+  const tryKeys = ["date", "match_date", "day", "dt"];
+  let parsed = null;
+  for (const k of tryKeys) {
+    if (obj[k]) {
+      const v = String(obj[k]);
+      const d = new Date(v);
+      if (!Number.isNaN(d.getTime())) {
+        parsed = d;
+        break;
+      }
+      // tenta formatos dd/mm ou dd/mm/yyyy comuns
+      const mm = v.match(/(\d{1,2})[\/\-](\d{1,2})([\/\-](\d{2,4}))?/);
+      if (mm) {
+        let day = parseInt(mm[1], 10);
+        let month = parseInt(mm[2], 10) - 1;
+        let year = mm[3] ? parseInt(mm[3].replace(/^\D+/,""), 10) : (new Date()).getFullYear();
+        if (year < 100) year += 2000;
+        const dd = new Date(year, month, day);
+        if (!Number.isNaN(dd.getTime())) {
+          parsed = dd;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!parsed) {
+    parsed = new Date(); // hoje
+  }
+
+  // formata YYYY-MM-DD (sem horário) para o Worker
+  const y = parsed.getFullYear();
+  const m = String(parsed.getMonth() + 1).padStart(2, "0");
+  const d = String(parsed.getDate()).padStart(2, "0");
+  obj.match_date = `${y}-${m}-${d}`;
+  return obj;
 }
 
 function parseEditForm(text) {
@@ -824,7 +884,7 @@ bot.action(/^confirm:(.+)$/i, async (ctx) => {
     const payload = {
       kind: "bets_create",
       telegram_id: batch.telegram_id,
-      items: (batch.items || []).map((x) => x.extracted),
+      items: (batch.items || []).map((x) => ensureExtractedHasDate(x.extracted || {})),
     };
 
     const res = await fetch(`${WORKER_BASE}/api/ingest/telegram`, {
