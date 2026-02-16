@@ -643,7 +643,7 @@ bot.on("photo", async (ctx) => {
           for (const { msg, hint } of entry.messages) {
             try {
               const r = await processMessage(msg, hint || bookHint, telegramCtx);
-              if (r && r.extracted) items.push({ extracted: r.extracted, summary_: r.summary_ });
+              if (r && r.extracted) items.push({ extracted: r.extracted, summary_: summarizeExtracted(r.extracted || {}) });
             } catch (e) {
               console.error("mediaGroup item error:", e);
               await telegramCtx.reply(`❌ Erro em uma foto do lote: ${e.message || "tente de novo."}`).catch(() => {});
@@ -680,7 +680,7 @@ bot.on("photo", async (ctx) => {
       telegram_id,
       chat_id,
       book_hint,
-      item: { extracted: one.extracted, summary_: one.summary_ },
+      item: { extracted: one.extracted, summary_: summarizeExtracted(one.extracted || {}) },
     });
   } catch (e) {
     console.error("photo handler error:", e);
@@ -720,7 +720,7 @@ bot.on("document", async (ctx) => {
       await ctx.reply("❌ Não consegui ler o bilhete. Envie como foto (não como arquivo) ou tente outra imagem.");
       return;
     }
-    const summary = data.summary_ ?? summarizeExtracted(data.extracted || {});
+    const summary = summarizeExtracted(data.extracted || {});
     queueReviewItem(ctx, {
       telegram_id,
       chat_id,
