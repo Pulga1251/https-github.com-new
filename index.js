@@ -333,13 +333,48 @@ async function renderBatchReview(ctx, token, opts = {}) {
   if (total === 0) {
     lines.push("⚠️ Nenhum item no lote. Envie novas fotos.");
   } else {
+    // helper to escape Markdown special chars in dynamic content (we use Markdown)
+    function escapeMarkdown(text) {
+      if (!text) return "";
+      return String(text)
+        .replace(/\\/g, "\\\\")
+        .replace(/_/g, "\\_")
+        .replace(/\*/g, "\\*")
+        .replace(/\[/g, "\\[")
+        .replace(/\]/g, "\\]")
+        .replace(/\(/g, "\\(")
+        .replace(/\)/g, "\\)")
+        .replace(/~/g, "\\~")
+        .replace(/`/g, "\\`")
+        .replace(/>/g, "\\>")
+        .replace(/#/g, "\\#")
+        .replace(/\+/g, "\\+")
+        .replace(/-/g, "\\-")
+        .replace(/=/g, "\\=")
+        .replace(/\|/g, "\\|")
+        .replace(/\{/g, "\\{")
+        .replace(/\}/g, "\\}")
+        .replace(/\./g, "\\.")
+        .replace(/!/g, "\\!");
+    }
+
     for (let i = start; i < end; i++) {
       const it = batch.items[i];
       const ex = it?.extracted || {};
-      const s = it?.summary_line || summarizeExtracted(ex);
+      let s = it?.summary_line || summarizeExtracted(ex);
+      // sanitize whitespace and truncate to reasonable length to avoid Telegram limits
+      s = String(s).replace(/\s+/g, " ").trim();
+      const MAX_SUMMARY_LEN = 800;
+      let truncated = false;
+      if (s.length > MAX_SUMMARY_LEN) {
+        s = s.slice(0, MAX_SUMMARY_LEN) + "...";
+        truncated = true;
+      }
       const missingSport = !ex?.sport;
       const sportNote = missingSport ? " • Esporte: (não detectado)" : "";
-      lines.push(`*${i + 1})* ${s}${sportNote}`);
+      const safeS = escapeMarkdown(s);
+      const safeSportNote = escapeMarkdown(sportNote);
+      lines.push(`*${i + 1})* ${safeS}${safeSportNote}${truncated ? " (truncado)" : ""}`);
     }
   }
   if (pages > 1) lines.push(`\nPágina ${p + 1}/${pages}`);
