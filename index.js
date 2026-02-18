@@ -181,6 +181,26 @@ function summarizeExtracted(x) {
   return s;
 }
 
+// concise summary for spreadsheet (plain text, minimal)
+function summarizeForSheet(x) {
+  const event = (x?.event || "").toString().replace(/\\s+/g," ").trim();
+  const market = (x?.market || "").toString().replace(/\\s+/g," ").trim();
+  const odd = (x?.odd !== undefined && x?.odd !== null && Number.isFinite(Number(x.odd))) ? Number(x.odd).toFixed(2) : null;
+  const stake = (x?.stake !== undefined && x?.stake !== null && Number.isFinite(Number(x.stake))) ? Number(x.stake).toFixed(2) : null;
+  const sport = (x?.sport || "").toString().trim();
+  const book = (x?.book || "").toString().trim();
+  const date = x?.match_date || x?.datetime || "";
+  let parts = [];
+  if (event) parts.push(event);
+  if (market) parts.push(market);
+  if (odd) parts.push(`odd ${odd}`);
+  if (stake) parts.push(`stake ${stake}`);
+  if (sport) parts.push(sport);
+  if (book) parts.push(book);
+  if (date) parts.push(date);
+  return parts.join(" • ");
+}
+
 // Garantir que cada aposta tenha uma data clara antes de enviar ao Worker.
 // Regras:
 // - Se o objeto extraído já contém `date`, `match_date` ou `day`, tenta parsear e usar no formato YYYY-MM-DD.
@@ -990,7 +1010,19 @@ bot.action(/^confirm:(.+)$/i, async (ctx) => {
     const payload = {
       kind: "bets_create",
       telegram_id: batch.telegram_id,
-      items: (batch.items || []).map((x) => ensureExtractedHasDate(x.extracted || {})),
+      items: (batch.items || []).map((x) => {
+        const ex = ensureExtractedHasDate(x.extracted || {});
+        return {
+          book: ex.book || null,
+          event: ex.event || null,
+          market: ex.market || null,
+          odd: ex.odd !== undefined ? ex.odd : null,
+          stake: ex.stake !== undefined ? ex.stake : null,
+          sport: ex.sport || null,
+          datetime: ex.match_date || ex.datetime || null,
+          sheet_summary: summarizeForSheet(ex),
+        };
+      }),
     };
 
     const res = await fetch(`${WORKER_BASE}/api/ingest/telegram`, {
