@@ -201,6 +201,57 @@ function summarizeForSheet(x) {
   return parts.join(" • ");
 }
 
+// Remove/clean fields that may contain large raw_text / JSON / base64 before displaying
+function sanitizeExtractedForDisplay(ex) {
+  if (!ex || typeof ex !== "object") return ex;
+  const out = { ...ex };
+  // remove raw_text to avoid huge blobs
+  if (out.raw_text) {
+    // keep a tiny hint only
+    try {
+      const t = String(out.raw_text || "");
+      // remove base64 images
+      out.raw_text = t.replace(/data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+/=]+/g, "[image omitted]");
+      // if still too long, truncate
+      if (out.raw_text.length > 300) out.raw_text = out.raw_text.slice(0, 280) + "…";
+    } catch (e) {
+      out.raw_text = "[omitted]";
+    }
+  }
+
+  // clean event/market from embedded JSON (common when worker echoes whole payload)
+  ["event", "market", "book"].forEach((k) => {
+    if (!out[k]) return;
+    try {
+      let v = String(out[k] || "");
+      // remove JSON-like blocks
+      v = v.replace(/\{[\s\S]*\}/g, "");
+      // unescape backslashes and quotes duplicated
+      v = v.replace(/\\+/g, "").replace(/\"+/g, '"');
+      // collapse whitespace
+      v = v.replace(/\s+/g, " ").trim();
+      if (v.length > 300) v = v.slice(0, 280) + "…";
+      out[k] = v;
+    } catch (e) { /* ignore */ }
+  });
+
+  return out;
+}
+
+// Prepare a minimal object to send to backend (avoid forwarding raw_text or large fields)
+function sanitizeExtractedForPayload(ex) {
+  if (!ex || typeof ex !== "object") return {};
+  return {
+    book: ex.book || null,
+    event: ex.event || null,
+    market: ex.market || null,
+    odd: (ex.odd !== undefined && ex.odd !== null) ? ex.odd : null,
+    stake: (ex.stake !== undefined && ex.stake !== null) ? ex.stake : null,
+    sport: ex.sport || null,
+    match_date: ex.match_date || ex.datetime || null,
+  };
+}
+
 // Garantir que cada aposta tenha uma data clara antes de enviar ao Worker.
 // Regras:
 // - Se o objeto extraído já contém `date`, `match_date` ou `day`, tenta parsear e usar no formato YYYY-MM-DD.
@@ -381,7 +432,9 @@ async function renderBatchReview(ctx, token, opts = {}) {
     for (let i = start; i < end; i++) {
       const it = batch.items[i];
       const ex = it?.extracted || {};
-      let s = it?.summary_line || summarizeExtracted(ex);
+      // sanitize for display to avoid showing raw_text / full JSON
+      const disp = sanitizeExtractedForDisplay(ex);
+      let s = it?.summary_line || summarizeExtracted(disp);
       // sanitize whitespace and truncate to reasonable length to avoid Telegram limits
       s = String(s).replace(/\s+/g, " ").trim();
       const MAX_SUMMARY_LEN = 800;
@@ -390,7 +443,7 @@ async function renderBatchReview(ctx, token, opts = {}) {
         s = s.slice(0, MAX_SUMMARY_LEN) + "...";
         truncated = true;
       }
-      const missingSport = !ex?.sport;
+      const missingSport = !disp?.sport;
       const sportNote = missingSport ? " • Esporte: (não detectado)" : "";
       const safeS = escapeMarkdown(s);
       const safeSportNote = escapeMarkdown(sportNote);
@@ -1011,7 +1064,8 @@ bot.action(/^confirm:(.+)$/i, async (ctx) => {
       kind: "bets_create",
       telegram_id: batch.telegram_id,
       items: (batch.items || []).map((x) => {
-        const ex = ensureExtractedHasDate(x.extracted || {});
+        const exRaw = ensureExtractedHasDate(x.extracted || {});
+        const ex = sanitizeExtractedForPayload(exRaw);
         return {
           book: ex.book || null,
           event: ex.event || null,
@@ -1020,7 +1074,7 @@ bot.action(/^confirm:(.+)$/i, async (ctx) => {
           stake: ex.stake !== undefined ? ex.stake : null,
           sport: ex.sport || null,
           datetime: ex.match_date || ex.datetime || null,
-          sheet_summary: summarizeForSheet(ex),
+          sheet_summary: summarizeForSheet(exRaw),
         };
       }),
     };
