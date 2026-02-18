@@ -431,24 +431,47 @@ async function renderBatchReview(ctx, token, opts = {}) {
 
     for (let i = start; i < end; i++) {
       const it = batch.items[i];
-      const ex = it?.extracted || {};
-      // sanitize for display to avoid showing raw_text / full JSON
-      const disp = sanitizeExtractedForDisplay(ex);
-      // prefer sheet_summary if present (clean single-line summary)
-      let s = it?.summary_line || ex?.sheet_summary || summarizeExtracted(disp);
-      // sanitize whitespace and truncate to reasonable length to avoid Telegram limits
-      s = String(s).replace(/\s+/g, " ").trim();
-      const MAX_SUMMARY_LEN = 800;
-      let truncated = false;
-      if (s.length > MAX_SUMMARY_LEN) {
-        s = s.slice(0, MAX_SUMMARY_LEN) + "...";
-        truncated = true;
+      const exRaw = it?.extracted || {};
+      const ex = sanitizeExtractedForDisplay(exRaw);
+
+      // prefer a concise prebuilt sheet_summary if available
+      const single = it?.summary_ || ex.sheet_summary || summarizeForSheet(exRaw) || "";
+      const title = `${ex.book ? `${ex.book} • ` : ""}${ex.event || "(sem jogo)"}`;
+      const market = ex.market || "";
+      // date display helper
+      function formatDisplayDateLocal(e) {
+        try {
+          if (e.match_date) {
+            const parts = String(e.match_date).split("-");
+            if (parts.length >= 3) return `${parts[2].padStart(2,"0")}/${parts[1].padStart(2,"0")}/${parts[0]}`;
+          }
+          if (e.datetime) {
+            const d = new Date(e.datetime);
+            if (!isNaN(d.getTime())) {
+              const date = d.toLocaleDateString("pt-BR");
+              const time = d.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+              return `${date} ${time}`;
+            }
+          }
+        } catch (e) {}
+        return "";
       }
-      const missingSport = !disp?.sport;
-      const sportNote = missingSport ? " • Esporte: (não detectado)" : "";
-      const safeS = escapeMarkdown(s);
-      const safeSportNote = escapeMarkdown(sportNote);
-      lines.push(`*${i + 1})* ${safeS}${safeSportNote}${truncated ? " (truncado)" : ""}`);
+      const dateDisplay = formatDisplayDateLocal(ex);
+      const odd = (ex.odd !== undefined && ex.odd !== null) ? Number(ex.odd).toFixed(2) : "";
+      const stake = (ex.stake !== undefined && ex.stake !== null) ? Number(ex.stake).toFixed(2) : "";
+      const sport = ex.sport || "";
+
+      // build multiline readable block (avoid raw JSON)
+      let block = `*${i + 1})* *${escapeMarkdown(title)}*\n`;
+      if (market) block += `_${escapeMarkdown(market)}_\n`;
+      if (dateDisplay) block += `🗓 ${escapeMarkdown(dateDisplay)}\n`;
+      if (odd || stake) block += `💠 Odd: ${escapeMarkdown(odd)} • 💵 Stake: ${escapeMarkdown(stake)}\n`;
+      if (sport) block += `🏷️ ${escapeMarkdown(sport)}\n`;
+      if (single && String(single).length > 0) {
+        const sn = String(single).replace(/\s+/g, " ").trim();
+        block += `\n${escapeMarkdown(sn.slice(0, 600))}\n`;
+      }
+      lines.push(block);
     }
   }
   if (pages > 1) lines.push(`\nPágina ${p + 1}/${pages}`);
