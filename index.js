@@ -429,10 +429,26 @@ async function renderBatchReview(ctx, token, opts = {}) {
         .replace(/!/g, "\\!");
     }
 
+    // helper to clean JSON-like dumps from strings
+    function cleanField(s) {
+      if (!s) return "";
+      let t = String(s);
+      // remove JSON-like blocks and excessive escapes
+      t = t.replace(/\\+/g, "");
+      t = t.replace(/\{[\s\S]*\}/g, "");
+      t = t.replace(/\"/g, '"');
+      t = t.replace(/\s+/g, " ").trim();
+      return t;
+    }
+
     for (let i = start; i < end; i++) {
       const it = batch.items[i];
       const exRaw = it?.extracted || {};
+      // defensive cleaning: remove any embedded JSON dumps in extracted fields
       const ex = sanitizeExtractedForDisplay(exRaw);
+      ex.event = cleanField(ex.event);
+      ex.market = cleanField(ex.market);
+      ex.book = cleanField(ex.book);
 
       // no sheet_summary: prefer only dynamic summary from extracted if needed
       const single = it?.summary_ || summarizeForSheet(exRaw) || "";
