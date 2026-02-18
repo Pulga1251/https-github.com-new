@@ -434,8 +434,8 @@ async function renderBatchReview(ctx, token, opts = {}) {
       const exRaw = it?.extracted || {};
       const ex = sanitizeExtractedForDisplay(exRaw);
 
-      // prefer a concise prebuilt sheet_summary if available
-      const single = it?.summary_ || ex.sheet_summary || summarizeForSheet(exRaw) || "";
+      // no sheet_summary: prefer only dynamic summary from extracted if needed
+      const single = it?.summary_ || summarizeForSheet(exRaw) || "";
       const title = `${ex.book ? `${ex.book} • ` : ""}${ex.event || "(sem jogo)"}`;
       const market = ex.market || "";
       // date display helper
@@ -467,10 +467,7 @@ async function renderBatchReview(ctx, token, opts = {}) {
       if (dateDisplay) block += `🗓 ${escapeMarkdown(dateDisplay)}\n`;
       if (odd || stake) block += `💠 Odd: ${escapeMarkdown(odd)} • 💵 Stake: ${escapeMarkdown(stake)}\n`;
       if (sport) block += `🏷️ ${escapeMarkdown(sport)}\n`;
-      if (single && String(single).length > 0) {
-        const sn = String(single).replace(/\s+/g, " ").trim();
-        block += `\n${escapeMarkdown(sn.slice(0, 600))}\n`;
-      }
+      // do not append full summary line to avoid extra descriptions; display only core fields above
       lines.push(block);
     }
   }
@@ -1073,17 +1070,101 @@ bot.action(/^confirm:(.+)$/i, async (ctx) => {
       return;
     }
 
-    await ctx.answerCbQuery("Gravando...");
+    await ctx.answerCbQuery("Verificando confiança...");
     // checa se alguma aposta não tem esporte
-    const missing = (batch.items || []).map((it, idx) => ({ idx, ex: it.extracted || {} })).filter(x => !x.ex.sport);
-    if (missing.length) {
-      // não permite confirmar, pede para editar esportes faltantes
-      await ctx.editMessageText(`⚠️ Não posso confirmar: ${missing.length} item(s) sem *Esporte* definido.\nUse *Editar* → *Esporte* para preencher.`, { parse_mode: "Markdown", reply_markup: { inline_keyboard: [] } });
-      await ctx.reply(`Itens sem esporte: ${missing.map(m => `#${m.idx + 1}`).join(", ")}. Clique em *Editar* na revisão e adicione o Esporte.`, { parse_mode: "Markdown" });
+    // Evaluate confidences
+    const items = batch.items || [];
+    const confidences = items.map((it) => (it.extracted && it.extracted.confidence && it.extracted.confidence.overall) ? Number(it.extracted.confidence.overall) : 0.0);
+    const anyLow = confidences.some(c => c < 0.6);
+    const anyMedium = confidences.some(c => c >= 0.6 && c < 0.85);
+    const allHigh = confidences.every(c => c >= 0.85);
+
+    if (allHigh) {
+      // safe to auto-save
+      await ctx.answerCbQuery("Confiança alta — gravando...");
+      pendingBatches.delete(token); // avoid double submit
+      // build payload and send (same as previous behavior)
+      const payload = {
+        kind: "bets_create",
+        telegram_id: batch.telegram_id,
+        items: (batch.items || []).map((x) => {
+          const exRaw = ensureExtractedHasDate(x.extracted || {});
+          const ex = sanitizeExtractedForPayload(exRaw);
+          return {
+            book: ex.book || null,
+            event: ex.event || null,
+            market: ex.market || null,
+            odd: ex.odd !== undefined ? ex.odd : null,
+            stake: ex.stake !== undefined ? ex.stake : null,
+            sport: ex.sport || null,
+            datetime: ex.match_date || ex.datetime || null,
+          };
+        }),
+      };
+      const res = await fetch(`${WORKER_BASE}/api/ingest/telegram`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-INGEST-KEY": INGEST_KEY },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      const msg = data?.message || data?.error || (res.ok ? null : `HTTP ${res.status}`);
+      const noButtons = { reply_markup: { inline_keyboard: [] } };
+      if (!res.ok) {
+        await ctx.editMessageText(`❌ Não foi possível gravar.`, noButtons);
+        await ctx.reply(`❌ Erro: ${msg || "Tente de novo mais tarde."}`);
+        return;
+      }
+      const okCount = (data.results || []).filter((r) => r.ok).length;
+      const failCount = (data.results || []).filter((r) => !r.ok).length;
+      const text = failCount > 0
+        ? `✅ Gravado!\nOK: ${okCount}\nFalhas: ${failCount}`
+        : `✅ Lote gravado com sucesso! (${okCount} aposta${okCount !== 1 ? "s" : ""})`;
+      await ctx.editMessageText(text, noButtons);
       return;
     }
-    pendingBatches.delete(token); // evita double-submit
 
+    if (anyLow) {
+      // open field-by-field review for first low-confidence item
+      const idx = confidences.findIndex(c => c < 0.6);
+      await ctx.editMessageText(`🛠 Revisão necessária: item #${idx+1} com baixa confiança. Abrindo edição...`, { reply_markup: { inline_keyboard: [] } });
+      await sendFieldButtonsEdit(ctx, token, idx);
+      return;
+    }
+
+    if (anyMedium) {
+      // prompt user: confirm anyway or edit
+      const kb = [
+        [ { text: "✅ Confirmar mesmo assim", callback_data: `force_confirm:${token}` }, { text: "✏️ Editar", callback_data: `edit:${token}` } ],
+      ];
+      await ctx.editMessageText(`⚠️ Alguns itens têm confiança média. Deseja confirmar mesmo assim ou editar?`, { parse_mode: "Markdown", reply_markup: { inline_keyboard: kb } });
+      return;
+    }
+
+    // fallback
+    await ctx.editMessageText("Não foi possível determinar ação. Use Editar.", { reply_markup: { inline_keyboard: [] } });
+  } catch (e) {
+    try { await ctx.answerCbQuery("Erro"); } catch {}
+    await ctx.reply(`❌ Falha ao gravar: ${e.message || "Erro inesperado. Tente de novo."}`);
+  }
+});
+
+bot.action(/^cancel:(.+)$/i, async (ctx) => {
+  const token = ctx.match[1];
+  pendingBatches.delete(token);
+  await ctx.answerCbQuery("Cancelado");
+  try {
+    await ctx.editMessageText("❌ Lote cancelado.", { reply_markup: { inline_keyboard: [] } });
+  } catch {}
+});
+
+// Force confirm (used when medium confidence and user wants to save anyway)
+bot.action(/^force_confirm:(.+)$/i, async (ctx) => {
+  try {
+    const token = ctx.match[1];
+    const batch = pendingBatches.get(token);
+    if (!batch) { await ctx.answerCbQuery("Lote expirou."); return; }
+    await ctx.answerCbQuery("Confirmando (forçado)...");
+    pendingBatches.delete(token);
     const payload = {
       kind: "bets_create",
       telegram_id: batch.telegram_id,
@@ -1098,45 +1179,28 @@ bot.action(/^confirm:(.+)$/i, async (ctx) => {
           stake: ex.stake !== undefined ? ex.stake : null,
           sport: ex.sport || null,
           datetime: ex.match_date || ex.datetime || null,
-          sheet_summary: summarizeForSheet(exRaw),
         };
       }),
     };
-
     const res = await fetch(`${WORKER_BASE}/api/ingest/telegram`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-INGEST-KEY": INGEST_KEY },
       body: JSON.stringify(payload),
     });
-
     const data = await res.json().catch(() => ({}));
-    const msg = data?.message || data?.error || (res.ok ? null : `HTTP ${res.status}`);
-
     const noButtons = { reply_markup: { inline_keyboard: [] } };
     if (!res.ok) {
       await ctx.editMessageText(`❌ Não foi possível gravar.`, noButtons);
-      await ctx.reply(`❌ Erro: ${msg || "Tente de novo mais tarde."}`);
+      await ctx.reply(`❌ Erro: ${data?.message || data?.error || `HTTP ${res.status}`}`);
       return;
     }
     const okCount = (data.results || []).filter((r) => r.ok).length;
-    const failCount = (data.results || []).filter((r) => !r.ok).length;
-    const text = failCount > 0
-      ? `✅ Gravado!\nOK: ${okCount}\nFalhas: ${failCount}`
-      : `✅ Lote gravado com sucesso! (${okCount} aposta${okCount !== 1 ? "s" : ""})`;
+    const text = `✅ Lote gravado (forçado). (${okCount} aposta${okCount !== 1 ? "s" : ""})`;
     await ctx.editMessageText(text, noButtons);
   } catch (e) {
     try { await ctx.answerCbQuery("Erro"); } catch {}
-    await ctx.reply(`❌ Falha ao gravar: ${e.message || "Erro inesperado. Tente de novo."}`);
+    await ctx.reply(`❌ Falha ao confirmar forçado: ${e.message || "Erro inesperado."}`);
   }
-});
-
-bot.action(/^cancel:(.+)$/i, async (ctx) => {
-  const token = ctx.match[1];
-  pendingBatches.delete(token);
-  await ctx.answerCbQuery("Cancelado");
-  try {
-    await ctx.editMessageText("❌ Lote cancelado.", { reply_markup: { inline_keyboard: [] } });
-  } catch {}
 });
 
 bot.catch((err) => {
