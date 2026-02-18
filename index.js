@@ -569,6 +569,77 @@ bot.command("vincular", async (ctx) => {
   }
 });
 
+// /debug <audit_id> - retorna registro de auditoria do Worker (raw_text + parsed_json)
+bot.command("debug", async (ctx) => {
+  try {
+    const parts = (ctx.message.text || "").trim().split(/\s+/);
+    const id = parts[1];
+    if (!id) {
+      await ctx.reply("Use: /debug <audit_id>");
+      return;
+    }
+    await ctx.reply("🔎 Buscando audit_id...");
+    const res = await fetch(`${WORKER_BASE}/api/admin/ticket_audit?id=${encodeURIComponent(id)}`, {
+      method: "GET",
+      headers: { "X-INGEST-KEY": INGEST_KEY }
+    });
+    const data = await res.json().catch(()=>null);
+    if (!res.ok) {
+      await ctx.reply(`❌ Erro: ${data?.message || `HTTP ${res?.status}`}`);
+      return;
+    }
+    const audit = data.audit;
+    if (!audit) {
+      await ctx.reply("❌ Audit não encontrado.");
+      return;
+    }
+    // Format nicely
+    const lines = [];
+    lines.push(`🧾 Audit ID: ${audit.id}`);
+    if (audit.telegram_id) lines.push(`👤 Telegram: ${audit.telegram_id}`);
+    if (audit.chat_id) lines.push(`💬 Chat: ${audit.chat_id}`);
+    if (audit.message_id) lines.push(`✉️ Message: ${audit.message_id}`);
+    if (audit.created_at) lines.push(`🕒 Criado em: ${audit.created_at}`);
+    if (audit.image_name) lines.push(`🖼 Imagem: ${audit.image_name} (${audit.image_type || ""}, ${audit.image_size || 0} bytes)`);
+    lines.push("");
+    if (audit.parsed_json) {
+      try {
+        const parsed = JSON.parse(audit.parsed_json);
+        lines.push("🔬 Parsed JSON:");
+        lines.push("```json");
+        lines.push(JSON.stringify(parsed, null, 2).slice(0, 1500));
+        lines.push("```");
+      } catch (e) {
+        lines.push("🔬 Parsed (raw):");
+        lines.push("```");
+        lines.push(String(audit.parsed_json).slice(0, 1500));
+        lines.push("```");
+      }
+    }
+    if (audit.raw_text) {
+      lines.push("");
+      lines.push("📋 Raw text (excerto):");
+      lines.push("```");
+      lines.push(String(audit.raw_text).slice(0, 1000));
+      lines.push("```");
+    }
+
+    // send as chunked messages if long
+    const msg = lines.join("\n");
+    if (msg.length > 4000) {
+      // split
+      for (let i = 0; i < msg.length; i += 3500) {
+        await ctx.reply(msg.slice(i, i + 3500), { parse_mode: "Markdown" }).catch(()=>{});
+      }
+    } else {
+      await ctx.reply(msg, { parse_mode: "Markdown" });
+    }
+  } catch (e) {
+    console.error("debug command error:", e);
+    await ctx.reply(`❌ Erro ao buscar audit: ${e.message || e}`);
+  }
+});
+
 // =======================
 // Wallet (+/-)
 // =======================
