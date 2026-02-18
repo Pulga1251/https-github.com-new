@@ -434,7 +434,8 @@ async function renderBatchReview(ctx, token, opts = {}) {
       const ex = it?.extracted || {};
       // sanitize for display to avoid showing raw_text / full JSON
       const disp = sanitizeExtractedForDisplay(ex);
-      let s = it?.summary_line || summarizeExtracted(disp);
+      // prefer sheet_summary if present (clean single-line summary)
+      let s = it?.summary_line || ex?.sheet_summary || summarizeExtracted(disp);
       // sanitize whitespace and truncate to reasonable length to avoid Telegram limits
       s = String(s).replace(/\s+/g, " ").trim();
       const MAX_SUMMARY_LEN = 800;
