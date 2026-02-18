@@ -433,10 +433,15 @@ async function renderBatchReview(ctx, token, opts = {}) {
     function cleanField(s) {
       if (!s) return "";
       let t = String(s);
-      // remove JSON-like blocks and excessive escapes
+      // remove excessive backslashes
       t = t.replace(/\\+/g, "");
-      t = t.replace(/\{[\s\S]*\}/g, "");
-      t = t.replace(/\"/g, '"');
+      // remove full {...} JSON blocks
+      t = t.replace(/\{[\s\S]*?\}/g, "");
+      // remove key:value pairs like "key":"value" or "key":value possibly comma separated
+      t = t.replace(/"[^"]+"\s*:\s*"[^"]*"\s*,?/g, "");
+      t = t.replace(/"[^"]+"\s*:\s*[^,\s}]+\s*,?/g, "");
+      // remove stray quotes and commas left
+      t = t.replace(/["{},]/g, " ");
       t = t.replace(/\s+/g, " ").trim();
       return t;
     }
