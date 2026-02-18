@@ -461,13 +461,55 @@ async function renderBatchReview(ctx, token, opts = {}) {
       const stake = (ex.stake !== undefined && ex.stake !== null) ? Number(ex.stake).toFixed(2) : "";
       const sport = ex.sport || "";
 
-      // build multiline readable block (avoid raw JSON)
-      let block = `*${i + 1})* *${escapeMarkdown(title)}*\n`;
-      if (market) block += `_${escapeMarkdown(market)}_\n`;
-      if (dateDisplay) block += `🗓 ${escapeMarkdown(dateDisplay)}\n`;
-      if (odd || stake) block += `💠 Odd: ${escapeMarkdown(odd)} • 💵 Stake: ${escapeMarkdown(stake)}\n`;
-      if (sport) block += `🏷️ ${escapeMarkdown(sport)}\n`;
-      // do not append full summary line to avoid extra descriptions; display only core fields above
+      // build formatted block exactly like requested (Portuguese labels, emojis)
+      let block = `*${i + 1})* ${escapeMarkdown(title)}\n`;
+      // status (default Pendente)
+      block += `⏳ Status: Pendente\n`;
+      // simple note placeholder for profit
+      block += `🔷 Sem lucro ou prejuízo.\n`;
+      // esporte
+      block += `⚽ Esporte: ${escapeMarkdown(sport || "Futebol")}\n`;
+      // aposta / mercado
+      const apostaLabel = (market && market.length > 0) ? market : (ex.event || "—");
+      block += `🎲 Aposta: ${escapeMarkdown(apostaLabel)}\n`;
+      block += `🎯 Mercado: ${escapeMarkdown(market || "—")}\n`;
+      // values
+      const money = (v) => {
+        try { return moneyBR(Number(v || 0)); } catch { return String(v || "0"); }
+      };
+      block += `💰 Valor Apostado: ${money(stake)}\n`;
+      block += `🔵 Odd: ${escapeMarkdown(odd || "")}\n`;
+      // potential return = stake * odd (total)
+      let potential = "";
+      try {
+        if (Number.isFinite(Number(odd)) && Number.isFinite(Number(stake))) {
+          potential = money(Number(odd) * Number(stake));
+        }
+      } catch (e) {}
+      block += `📈 Retorno Potencial: ${potential || money(0)}\n`;
+      // (Tipo removido)
+      // date and time separate
+      if (ex.datetime) {
+        try {
+          const dt = new Date(ex.datetime);
+          if (!isNaN(dt.getTime())) {
+            const dd = dt.toLocaleDateString("pt-BR");
+            const tt = dt.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+            block += `📅 Data: ${escapeMarkdown(dd)}\n`;
+            block += `⏱ Hora: ${escapeMarkdown(tt)}\n`;
+          } else {
+            block += `📅 Data: Definir Manualmente\n`;
+            block += `⏱ Hora: Definir Manualmente\n`;
+          }
+        } catch (e) {
+          block += `📅 Data: Definir Manualmente\n`;
+          block += `⏱ Hora: Definir Manualmente\n`;
+        }
+      } else {
+        block += `📅 Data: Definir Manualmente\n`;
+        block += `⏱ Hora: Definir Manualmente\n`;
+      }
+      // push block
       lines.push(block);
     }
   }
