@@ -220,18 +220,19 @@ function sanitizeExtractedForDisplay(ex) {
     }
   }
 
-  // clean event/market from embedded JSON (common when worker echoes whole payload)
+  // Gentle clean for display: collapse whitespace, unescape common escapes, truncate.
   ["event", "market", "book"].forEach((k) => {
     if (!out[k]) return;
     try {
       let v = String(out[k] || "");
-      // remove JSON-like blocks
-      v = v.replace(/\{[\s\S]*\}/g, "");
-      // unescape backslashes and quotes duplicated
-      v = v.replace(/\\+/g, "").replace(/\"+/g, '"');
-      // collapse whitespace
+      // remove base64 if ever embedded
+      v = v.replace(/data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+/=]+/g, "[image omitted]");
+      // unescape simple backslashes (but keep textual braces/colons intact)
+      v = v.replace(/\\+/g, "");
+      // collapse excessive whitespace
       v = v.replace(/\s+/g, " ").trim();
-      if (v.length > 300) v = v.slice(0, 280) + "…";
+      // limit length for UI but preserve meaningful content
+      if (v.length > 500) v = v.slice(0, 500) + "…";
       out[k] = v;
     } catch (e) { /* ignore */ }
   });
@@ -451,10 +452,19 @@ async function renderBatchReview(ctx, token, opts = {}) {
       const it = batch.items[i];
       const exRaw = it?.extracted || {};
       // defensive cleaning: remove any embedded JSON dumps in extracted fields
+      // DEBUG: log before/after cleaning to trace lost fields
+      try { console.log("DEBUG render: exRaw:", JSON.stringify(exRaw).slice(0,2000)); } catch(e){}
       const ex = sanitizeExtractedForDisplay(exRaw);
+      try { console.log("DEBUG render: after sanitize:", JSON.stringify(ex).slice(0,2000)); } catch(e){}
+      // keep cleanField but applied conservatively
       ex.event = cleanField(ex.event);
       ex.market = cleanField(ex.market);
       ex.book = cleanField(ex.book);
+      // DEBUG: show raw extracted JSON above the rendered card for visibility
+      try {
+        const rawJson = JSON.stringify(exRaw, null, 2);
+        lines.push("```json\n" + rawJson.slice(0,1200) + (rawJson.length > 1200 ? "\n…(truncated)" : "") + "\n```");
+      } catch (e) {}
 
       // no sheet_summary: prefer only dynamic summary from extracted if needed
       const single = it?.summary_ || summarizeForSheet(exRaw) || "";
@@ -941,6 +951,27 @@ bot.on("photo", async (ctx) => {
     await ctx.reply("🔄 Processando bilhete...").catch(() => {});
     const one = await processMessage(ctx.message, book_hint, ctx);
     if (!one) return;
+
+    // DEBUG: enviar ao chat o response bruto do Worker para investigação
+    try {
+      const safeJson = (obj) => {
+        try { return JSON.stringify(obj, null, 2); } catch { return String(obj); }
+      };
+      // log no console para servidor
+      console.log("DEBUG: worker response (truncated):", safeJson(one).slice(0, 4000));
+      // enviar mensagem de debug ao usuário (truncada)
+      const snippet = safeJson(one).slice(0, 1500);
+      if (!one.extracted) {
+        await ctx.reply("🔍 DEBUG: Worker não retornou `extracted`. Mostrando resposta parcial:", { parse_mode: "Markdown" }).catch(()=>{});
+        await ctx.reply("```json\n" + snippet + (snippet.length >= 1500 ? "\n…(truncated)" : "") + "\n```", { parse_mode: "Markdown" }).catch(()=>{});
+      } else {
+        const exSnippet = safeJson(one.extracted).slice(0, 1500);
+        await ctx.reply("🔍 DEBUG: `extracted` recebido (excerpt):", { parse_mode: "Markdown" }).catch(()=>{});
+        await ctx.reply("```json\n" + exSnippet + (exSnippet.length >= 1500 ? "\n…(truncated)" : "") + "\n```", { parse_mode: "Markdown" }).catch(()=>{});
+      }
+    } catch (e) {
+      console.error("DEBUG send error:", e);
+    }
 
     // Auto-save if single item has high confidence
     try {
