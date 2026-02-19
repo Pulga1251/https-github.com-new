@@ -70,7 +70,7 @@ async function ingestTelegram(payload) {
   return data;
 }
 
-async function sendImageToWorker({ telegram_id, chat_id, fileUrl, filename, book_hint }) {
+async function sendImageToWorker({ telegram_id, chat_id, fileUrl, filename, book_hint, caption }) {
   const imgResp = await fetch(fileUrl);
   if (!imgResp.ok) throw new Error("Falha ao baixar imagem do Telegram");
 
@@ -80,6 +80,7 @@ async function sendImageToWorker({ telegram_id, chat_id, fileUrl, filename, book
   form.append("telegram_id", telegram_id);
   form.append("chat_id", chat_id);
   if (book_hint) form.append("book_hint", book_hint);
+  if (caption) form.append("caption", caption);
   form.append("image", buf, { filename: filename || "ticket.jpg", contentType: "image/jpeg" });
 
   const res = await fetch(`${WORKER_BASE}/api/ai/parse-ticket`, {
@@ -868,12 +869,14 @@ bot.on("photo", async (ctx) => {
       const bestM = photosM[photosM.length - 1];
       if (!bestM?.file_id) return null;
       const linkM = await telegramCtx.telegram.getFileLink(bestM.file_id);
+      const captionText = String(msg.caption || "").trim();
       const { res, data } = await sendImageToWorker({
         telegram_id,
         chat_id,
         fileUrl: linkM.href,
         filename: "ticket.jpg",
         book_hint: hint,
+        caption: captionText,
       });
       if (!res.ok) {
         if (data?.code === "NOT_LINKED") {
@@ -964,12 +967,14 @@ bot.on("document", async (ctx) => {
     const caption = String(ctx.message?.caption || "").trim();
     const book_hint = caption ? normalizeBook(caption) : "";
     const link = await ctx.telegram.getFileLink(doc.file_id);
+    const captionText = String(ctx.message?.caption || "").trim();
     const { res, data } = await sendImageToWorker({
       telegram_id,
       chat_id,
       fileUrl: link.href,
       filename: doc.file_name || "ticket.jpg",
       book_hint,
+      caption: captionText,
     });
     if (!res.ok) {
       if (data?.code === "NOT_LINKED") {
