@@ -454,12 +454,34 @@ async function renderBatchReview(ctx, token, opts = {}) {
       // defensive cleaning: remove any embedded JSON dumps in extracted fields
       // DEBUG: log before/after cleaning to trace lost fields
       try { console.log("DEBUG render: exRaw:", JSON.stringify(exRaw).slice(0,2000)); } catch(e){}
-      const ex = sanitizeExtractedForDisplay(exRaw);
+      // Try to recover fields if worker returned embedded JSON inside strings
+      function tryParseEmbeddedJson(s) {
+        try {
+          if (!s || typeof s !== "string") return null;
+          const m = s.match(/\{[\s\S]*\}/);
+          if (!m) return null;
+          const parsed = JSON.parse(m[0]);
+          return parsed;
+        } catch (e) { return null; }
+      }
+
+      // prefer the worker's extracted fields as-is; attempt to recover if empty
+      let ex = sanitizeExtractedForDisplay(exRaw);
       try { console.log("DEBUG render: after sanitize:", JSON.stringify(ex).slice(0,2000)); } catch(e){}
-      // keep cleanField but applied conservatively
-      ex.event = cleanField(ex.event);
-      ex.market = cleanField(ex.market);
-      ex.book = cleanField(ex.book);
+
+      // If event/market/book are missing, try to parse them from raw_text if it contains JSON
+      if ((!ex.event || String(ex.event).trim() === "") && ex.raw_text) {
+        const fromJson = tryParseEmbeddedJson(ex.raw_text) || tryParseEmbeddedJson(String(exRaw.event || ""));
+        if (fromJson) {
+          ex.event = ex.event || fromJson.event || exRaw.event || ex.event;
+          ex.market = ex.market || fromJson.market || exRaw.market || ex.market;
+          ex.book = ex.book || fromJson.book || exRaw.book || ex.book;
+        }
+      }
+      // conservative cleanup: only strip obvious JSON blocks, keep normal text intact
+      ex.event = (ex.event && String(ex.event).replace(/\{[\s\S]*\}/g, "").replace(/\\+/g, "").trim()) || ex.event;
+      ex.market = (ex.market && String(ex.market).replace(/\{[\s\S]*\}/g, "").replace(/\\+/g, "").trim()) || ex.market;
+      ex.book = (ex.book && String(ex.book).replace(/\{[\s\S]*\}/g, "").replace(/\\+/g, "").trim()) || ex.book;
       // DEBUG: show raw extracted JSON above the rendered card for visibility
       try {
         const rawJson = JSON.stringify(exRaw, null, 2);
