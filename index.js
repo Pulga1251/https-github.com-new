@@ -853,7 +853,7 @@ bot.on("photo", async (ctx) => {
     const telegram_id = String(ctx.from?.id || "").trim();
     const chat_id = String(ctx.chat?.id || "").trim();
     const caption = String(ctx.message.caption || "").trim();
-    const book_hint = caption ? normalizeBook(caption) : "";
+    const book_hint = caption && /[A-Za-zÀ-ÿ]/.test(caption) ? normalizeBook(caption) : "";
 
     const photos = ctx.message.photo || [];
     const best = photos[photos.length - 1];
@@ -942,6 +942,38 @@ bot.on("photo", async (ctx) => {
     const one = await processMessage(ctx.message, book_hint, ctx);
     if (!one) return;
 
+    // Auto-save if single item has high confidence
+    try {
+      const conf = (one.extracted && one.extracted.confidence && Number(one.extracted.confidence.overall)) ? Number(one.extracted.confidence.overall) : 0;
+      if (conf >= 0.85) {
+        // prepare payload and send to Worker directly
+        const exRaw = ensureExtractedHasDate(one.extracted || {});
+        const ex = sanitizeExtractedForPayload(exRaw);
+        const payload = {
+          kind: "bets_create",
+          telegram_id,
+          items: [{
+            book: ex.book || null,
+            event: ex.event || null,
+            market: ex.market || null,
+            odd: ex.odd !== undefined ? ex.odd : null,
+            stake: ex.stake !== undefined ? ex.stake : null,
+            sport: ex.sport || null,
+            datetime: ex.match_date || ex.datetime || null,
+          }],
+        };
+        try {
+          await ctx.reply("✅ Confiança alta — gravando automaticamente...").catch(()=>{});
+          const res = await ingestTelegram(payload);
+          await ctx.reply(`✅ Gravado automaticamente!`).catch(()=>{});
+          return;
+        } catch (e) {
+          console.error("auto-save error:", e);
+          // fallthrough to normal review flow if auto-save failed
+        }
+      }
+    } catch (e) { /* ignore */ }
+
     queueReviewItem(ctx, {
       telegram_id,
       chat_id,
@@ -965,7 +997,7 @@ bot.on("document", async (ctx) => {
     const telegram_id = String(ctx.from?.id || "").trim();
     const chat_id = String(ctx.chat?.id || "").trim();
     const caption = String(ctx.message?.caption || "").trim();
-    const book_hint = caption ? normalizeBook(caption) : "";
+    const book_hint = caption && /[A-Za-zÀ-ÿ]/.test(caption) ? normalizeBook(caption) : "";
     const link = await ctx.telegram.getFileLink(doc.file_id);
     const captionText = String(ctx.message?.caption || "").trim();
     const { res, data } = await sendImageToWorker({
